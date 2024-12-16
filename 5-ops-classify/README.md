@@ -288,7 +288,7 @@ dispatch:
 
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;**是：你可能在实现中调用了其他at::操作。请转到步骤2。**
 
-**step2: 考虑训练，你的kernel是否支持autograd ？**
+**step2: 考虑训练，你的kernel是否支持autograd ？** <br>
 **是：** 换句话说，你提供了一个支持inference和自动微分的CompositeImplicitAutograd kernel。为了使用自动微分支持进行训练，只需**跳过添加分发dispatch部分**，你就完成了。这将使这个op能够正确地注册用于推理和训练。<br>
 **是:**，但如果你仍然想提供一个数值稳定的梯度公式而不是使用自动微分，那么请编写（该公式）。
 ```yaml
@@ -300,24 +300,51 @@ dispatch:
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;你已经完成了。这个操作将在所有后端的推理中被调用。<br>
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;注意：为了支持训练，你需要添加一个自动微分的公式，否则在反向传播时调用具有requires_grad=True的张量时会出错。<br>
 
-**否：此类操作主要使用的是_out样板代码，而其out版本没有定义导数公式。例如：
+**否：** 此类操作主要使用的是_out样板代码，而其out版本没有定义导数公式。例如：<br>
+```yaml
+Tensor& sign_out(Tensor& result, const Tensor& self) { return unary_op_impl_out(result, self, sign_stub); }
+Tensor sign(const Tensor& self) { return unary_op_impl(self, at::sign_out); }
+Tensor& sign_(Tensor& self) { return unary_op_impl_(self, at::sign_out); }
+```
+sign_out 使用 DispatchStub，因此其分发部分列举了支持的后端。对于 sign 和 sign_，请编写:
+```yaml
+dispatch:
+  CompositeExplicitAutograd: kernel
+```
 
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;你已经完成了。这个操作将在所有后端的推理过程中被调用。注意：为了支持训练，你需要为 sign 函数添加一个自动梯度（autograd）公式，否则，当使用一个 requires_grad=True 的张量调用它时，在反向传播过程中会出错。<br>
 
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;注意：对于使用此模板的操作（ops），当前的计划是在实现中将 at:: 替换为 at::native，并添加一个带有设备关键字的分发部分.<br>
 
+**step3 validate** <br>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;验证计算得出的dispather table是否与您的期望相符。您可以使用 torch/_python_dispatcher.py 中提供的 PythonDispatcher。它会显示对于某个operator，在您的注册之后计算得出的dispatch table是什么样的。<br>
 
+```yaml
+dispatcher = PythonDispatcher()
+dispatcher.register(["CPU", "XLA", "AutogradCPU", "CompositeImplicitAutograd"])
+print(dispatcher.dispatchTable()) # Tells you exactly which kernel is used for certain backend.
+```
 
+**step4 TODO: AutogradCPUOrCUDA** <br>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;请注意, 在 native_functions.yaml 文件中，您可以为同一个操作（op）混合使用后端关键字和上述别名关键字：<br>
+- 直接注册到后端的优先级总是高于别名。
+- 请勿为同一个操作提供多个别名关键字：别名关键字有优先级顺序，CompositeExplicitAutograd > CompositeImplicitAutograd。例如，如果为一个操作同时添加了 CompositeImplicitAutograd 和 CompositeExplicitAutograd kernel，那么在推理和训练过程中都会完全忽略 CompositeImplicitAutograd 内核。因此，在解析 native_functions.yaml 文件时会触发错误。<br>
 
+## 2.3 这个函数会暴露给Python吗？命名空间是什么？
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;我们并**不会为所有函数生成Python绑定**。在Python绑定生成过程中，我们会跳过某些特定模式的函数名，例如以*_backward结尾的。请查看tools/autograd/gen_python_functions.py以了解最新的规则。<br>
 
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;生成的绑定(bindings)要么作为python_variable上的方法暴露出来，要么作为torch._C._nn（标记为python_module: nn）、torch._C._fft（标记为python_module: fft）、torch._C._linalg（标记为python_module: linalg）对象、torch._C._sparse（标记为python_module: sparse）对象、torch._C._special（标记为python_module: special）对象或torch._C._nested（标记为python_module: nested）对象上的函数暴露出来。<br>
 
+## 2.4 未定义张量的惯例
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;默认情况下，ATen函数的张量参数总是已定义的，除非您通过编写Tensor?或Tensor? x=[]明确指定允许未定义的张量，后者在C++中需要为参数分配默认值时（例如，在其他具有默认值的参数中间）是必需的。<br>
 
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;返回未定义张量的规则稍微有些微妙，但你只需要记住一种情况：<br>
+- 如果所讨论的函数是一个反向函数，并且它接受一个std::array<bool,N>类型的output_mask参数，那么对于output_mask[i]为false的每一个元组位置i，你必须返回一个未定义的张量；
+- 否则，你绝对不能返回一个未定义的张量.
 
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;你可能想要返回未定义张量的最常见情况是：
+- 当你有一个前向函数，在启用**训练时**可能会返回一个buffer，但在推理模式下不返回该缓冲区。在这种情况下，只需返回一个适当类型的零大小张量即可。
+- 另一种情况是，你有一个反向函数，其中某个输入的梯度为零。在这种情况下，你应该创建一个适当大小的零填充张量来作为该输入的返回值。为了获取形状，使用输入的TensorGeometry可能会有所帮助。
 
-
-
-
-
-
-
-
-
-
+## 2.5 调试技巧
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;如果你在构建ATen时遇到了链接器错误，那很可能意味着你错误地复制粘贴了你的函数的C++定义。请仔细检查你的张量参数，并确保你在函数签名中使用了const Tensor&。<br>
