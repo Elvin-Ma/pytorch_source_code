@@ -260,7 +260,47 @@ use_const_ref_for_mutable_tensors: True
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;同时请注意，对于添加到native_functions.yaml中的新操作符，如果它们满足上述要求，则应该包含autogen关键字，因为函数化依赖于它。我们将在代码生成过程中强制执行这一点。<br>
 
 
+# 2 Writing an implementation in C++
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;原生函数的实现位于native/目录中的相应C++文件中（这些文件大致按topic组织，但除了cuda目录外，它们的组织没有语义上的意义，因为cuda目录是构建系统唯一知道如何构建.cu文件的地方）。要编写一个native函数，你只需要编写一个与ATen meta data中生成的头文件签名相匹配的C++实现（不需要头文件）。有许多简单的原生函数；你可以看看其中的一些来了解该怎么做。<br>
 
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;虽然编写ATen函数主要是实现你想要的算法，但还有一些不那么明显的细节你也应该考虑。<br>
+
+## 2.1 Will your function be automatically differentiable ?
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;如果你正在编写一对函数foo和foo_backward，并且意图是foo_backward实现foo的导数，那么你的foo实现可能不是自动可微分的：它可能会使用像data_ptr()这样的函数，或者根据它是在CPU还是CUDA张量上操作而进行不同的分发。一旦你编写了这两个函数，你需要在tools/autograd/derivatives.yaml中编写一个条目来将它们关联起来。<br>
+
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;然而，在某些情况下，你可以在ATen中编写一个函数，并且它会自动被微分！当函数实现仅调用其他本身可微分的操作时，就可能出现这种情况。在这种情况下，你不需要在tools/autograd/derivatives.yaml中编写条目。<br>
+
+## 2.2 Choosing the right dispatch keyword
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;在C++中编写完原生函数后，选择native_functions.yaml中使用的分发关键字(dispatch keyword)至关重要，因为它为分发器提供了有关实现的后端和自动微分支持的信息。<br>
+
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;以下是决定正确分发关键字的步骤：<br>
+
+**step1：考虑inference 前向：你的内核是否适用于所有后端？** <br>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;**否:** 你可能为不同的后端提供了不同的内核，例如，在实现中使用了依赖于后端的逻辑，或者它是通过**DispatchStub**实现的。DispatchStub仅在你明确通过REGISTER_DISPATCH提供一个内核时才支持一个后端。通常，它只支持一些内置后端，如CPU、CUDA、QuantizedCPU等，而不支持外部后端，如XLA。请编写一个分发部分(dispatch)，枚举所有支持的后端，并将它们指向相应的实现。<br>
+```yaml
+dispatch:
+  CPU: kernel_cpu
+  CUDA: kernel_cuda
+  QuantizedCPU: kernel_quantized_cpu
+```
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;你已经完成了。现在这个操作将在CPU/CUDA/QuantizedCPU后端的推理中被调用！<br>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;注意：为了支持训练，你需要在derivatives.yaml中编写一个公式，因为你的后端实现不支持自动微分。<br>
+
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;**是：你可能在实现中调用了其他at::操作。请转到步骤2。**
+
+**step2: 考虑训练，你的kernel是否支持autograd ？**
+**是：** 换句话说，你提供了一个支持inference和自动微分的CompositeImplicitAutograd kernel。为了使用自动微分支持进行训练，只需**跳过添加分发dispatch部分**，你就完成了。这将使这个op能够正确地注册用于推理和训练。<br>
+**是:**，但如果你仍然想提供一个数值稳定的梯度公式而不是使用自动微分，那么请编写（该公式）。
+```yaml
+dispatch:
+  CompositeExplicitAutograd: kernel
+```
+*(注意：这里显示声明需要一个backward kernel)*<br>
+
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;你已经完成了。这个操作将在所有后端的推理中被调用。<br>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;注意：为了支持训练，你需要添加一个自动微分的公式，否则在反向传播时调用具有requires_grad=True的张量时会出错。<br>
+
+**否：此类操作主要使用的是_out样板代码，而其out版本没有定义导数公式。例如：
 
 
 
