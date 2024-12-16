@@ -172,6 +172,108 @@ dispatch:
     CompositeImplicitAutograd: func_out
 ```
 
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;如果两个后端有相同的调度函数，你可以分别为CPU和CUDA编写：func，以便在这两种情况下重用相同的函数名。通过搜索[codegen](https://github.com/pytorch/pytorch/blob/master/torchgen/gen.py) 中的dispatch_keys可以找到可用的后端选项。此外，还有三个特殊的"generic通用"后端：<br>
+
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;**CompositeExplicitAutograd（之前称为DefaultBackend）**：这是适用于所有后端的kernel实现，但**需要在derivatives.yaml中明确定义反向函数以支持自动微分（autograd）**。此键的**最典型用途是用于委托(delegating)函数**; 即那些只执行少量工作，然后**将实际的大量计算任务委托给另一个操作符的函数**。在底层实现中，将内核注册到CompositeExplicitAutograd相当于将该内核注册到每个后端（例如，CPU、CUDA）。注意：**调用DispatchStub的内核不应注册为CompositeExplicitAutograd，因为DispatchStub仅适用于CPU和CUDA。** <br>
+
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;**CompositeExplicitAutogradNonFunctional:** 与CompositeExplicitAutograd类似，但此键应在以下情况下使用：（1）您的kernel是为非别名操作符(non-aliasing operator)编写的。（2）并且它内部调用了一个别名操作符(aliasing operator)。这方面的一个例子是select_backward，它是非别名的，但会分解为select。我们希望区分“普通”的CompositeExplicitAutograd kernel和这些内核，因为一些后端不希望将一个非别名操作分解为别名操作。LazyTensor和XLA是当前的两个示例——由于它们操作的是函数式中间表示（IR），因此它们更倾向于直接使用自己的内核来实现非别名操作符，而不是使用会导致更多别名操作符的分解(decomposition)。<br>
+
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;**CompositeImplicitAutograd(之前称为Math)**：这是适用于所有后端的kernel implementations，并且能够**隐式支持自动微分（autograd）**，因为**它调用的所有操作都支持自动微分**。直接使用这个键的情况应该很少：如果您没有提供dispatch table，我们会默认将您的内核注册为CompositeImplicitAutograd。如果您有专门的CPU和CUDA实现，但希望为可能没有专门实现的外部后端提供一个(fallback lowering)选项，那么在现有的分发表中显式添加这个键可能是有用的。<br>
+
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;注册到复合后端(Composite backends)的函数应该能够在任何后端上工作，只要它们调用的嵌套函数(nested functions)也能在那些后端上工作。例如，假设my_op可以以以下方式实现：<br>
+
+```yaml
+at::Tensor my_op(const Tensor& self, const Tensor& other) {
+  return self + 2 * other;
+}
+```
+
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;如果我们系统中已经知道了加法（+）和乘法（*）算子的inference kernel和 导数公式(derivative)，您**只需要**将my_op注册到CompositeImplicitAutograd中，推理和自动微分（autograd）就会正常工作。虽然这里看起来我们只写下了推理公式，但PyTorch的自动微分系统会利用链式法则以及加法和乘法算子的导数，正确地为my_op设置反向传播。换句话说, $\frac{d_out}{d_self} = 1$ 和 $\frac{d_out}{d_other} = 2$ 可以从my_op的inference kernel中自动推导出来。当然，如果我们没有为加法或乘法算子定义导数公式，那么my_op的反向传播就无法自动推导了。<br>
+
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;决定您的内核是使用隐式还是显式自动微分（autograd），可以通过以下步骤来确定: <br>
+1. 如果可能的话，首先尝试使用由现有算子组合而成的CompositeImplicitAutograd内核。<br>
+2. 如果您不希望使用CompositeImplicitAutograd内核推导出的**梯度公式来进行自动微分(仅仅对梯度而言)**，以获取更好的性能或数值稳定性，那么您应该使用CompositeExplicitAutograd来注册内核，以便它(组合的kernel)仅用于前向推理(inference)。之后，对于自动微分，根据您的自动微分kernel是否适用于所有后端，您可以将它们(自己的kernel)放在别名Autograd或特定键（如AutogradCPU）下(即反向kernel需要自己实现).<br>
+3. 如果您更倾向于编写特定于后端的kernel(前反向都包含)，请使用为您的后端保留的分发键，例如CPU/AutogradCPU。<br>
+
+**重要提示:** 因为没有 dispatch : section 的ops 会隐式注册CompositeImplicitAutograd kernel。因此，当您为这些ops之一添加一个特定于后端的内核(以及相应的dispatch:sect)时，您还必须添加一个CompositeImplicitAutograd:entry，该条目应命名旧的kernel实现（通常根据op命名，如果适用，会添加下划线_），以便**其他后端**仍然可以使用它。<br>
+
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;如果您在C++中实现了一个原生函数，并且想要了解在native_functions.yaml中应该使用哪个分发关键字（dispatch keyword），请遵循分发关键字的相关步骤(下文Choosing the right dispatch keyword)。<br>
+
+## 1.5 Composite Compliance 复合合规性
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;定义：“复合函数(composite function)”是指注册为CompositeImplicitAutograd的算子，或者是由PyTorch operations组成的（Python或C++）函数。后者的示例包括反向公式和前向模式自动微分公式。<br>
+
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;在PyTorch库中定义的复合函数必须适用于大多数（如果不是全部）**后端/子类**。这意味着我们施加了一系列约束，使得在PyTorch库代码中编写复合函数比用户编写PyTorch代码更加困难。<br>
+
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;如果您希望执行被禁止的操作（可能是出于性能原因），请**为您的函数编写一个反向公式**，以便它不再将函数的部分内容隐藏在不是CompositeImplicitAutograd的新aten算子中。<br>
+
+复合函数不得：<br>
+1. 调用resize_或其等效操作。这些操作对于许多后端（如vmap和meta）来说很难处理.
+2. 调用带有out=参数的操作。vmap无法处理这类操作，而且可能导致派发到Python的对象失去其子类化特性.
+3. 在不执行分发的情况下更改张量的元数据。这类操作的例子包括直接访问TensorImpl API来修改张量的大小/步长/元数据。
+4. 与最后一点相似，不允许访问data_ptr或进行元素访问。这些操作不会通过分发器。
+5. copy_是一个边缘情况。如果您能够重写您的操作而不使用copy_，那么您绝对应该这样做；如果您不是将内容复制到一个视图（view）中，这应该是很容易做到的。否则，保持代码原样也是可以接受的。
+
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;我们在test/test_ops.py中有CompositeImplicitAutograd合规性测试。这些测试并不完美（因为检查上述所有情况相当困难），所以如果发现有任何问题，请大声指出来。<br>
+
+
+## 1.6 device_guard
+```yaml
+device_guard: False
+```
+
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;默认情况下，ATen代码生成会生成一个DeviceGuard调用，该调用将确保kernel代码在与第一个张量参数（或者如果函数接受张量列表，则是第一个张量列表参数中的第一个张量）的设备相匹配的设备上运行。在大多数情况下，这意味着内核作者不必担心设置设备。<br>
+
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;然而，在某些情况下，设置设备是不必要的，因为例如，你调用的函数已经管理了设备保护设置，或者你的函数根本不与任何设备交互。在这种情况下，可以通过在函数定义中添加device_guard: False来**禁用设备保护的代码生成**。<br>
+
+## 1.7 device_check
+```yaml
+device_check: NoCheck
+```
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;默认情况下，ATen代码生成会进行设备检查，以确保传递给kernel的**所有张量参数都在同一设备上**。<br>
+
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;然而，在某些情况下，检查设备是不必要的，因为例如，你调用的函数允许在多个设备上工作。在这种情况下，可以通过在函数定义中添加device_check: NoCheck来禁用设备检查的代码生成。<br>
+
+## 1.8 manual_kernel_registration
+```yaml
+manual_kernel_registration: True
+```
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;当设置了这个标志时，我们不会生成代码来自动将C++算子实现注册到TypeDefault（即catchAll分发关键字）与dispatcher。对于同一个op来说，同时拥有dispatch 部分和manual_kernel_registration: True是没有意义的。你可以在torch/csrc/autograd/VariableTypeManual.cpp中找到手动注册的部分。目前，将此字段设置为True的操作应该与tools/autograd/gen_variable_type.py中的MANUAL_CATCHALL相匹配（它可以是MANUAL_CATCHALL的超集，但我们没有这样的用例）。这个字段应该很少使用。<br>
+
+## 1.9 use_const_ref_for_mutable_tensors
+```yaml
+use_const_ref_for_mutable_tensors: True
+```
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;当设置了这个标志后，我们将为那些底层数据可能会改变的张量生成const Tensor&（或类似）的参数，就像我们为其他张量所做的那样。以前，我们**生成的是Tensor &类型的参数**，这种参数有两个问题：1）它允许改变张量本身所引用的TensorImpl；2）它并不是必需的，因为**底层数据的改变并不需要通过修改张量引用来实现**。（这就像是当我们需要const T*（指向常量的指针）时(指向的内容不能该)，却错误地使用了T * const（常量指针）(指针本身不能改，但内容可改)。）
+
+## 1.10 autogen
+```yaml
+- func: my_op_(Tensor(a!) self) -> Tensor(a!)
+...
+  autogen: my_op, my_op.out
+```
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;autogen关键字用于指定代码生成系统应该为哪个原生函数生成实现。<br>
+- 对于原生函数的inplace变体（op name以_结尾），我们将生成一个函数式变体和一个out=变体。
+- 如果给出了函数式变体，我们将生成一个out=变体。
+- 我们不支持为视图操作、绕过分发器的操作以及复合操作使用autogen。
+
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;我们还会为生成的op生成kernel，这些内核仅仅是从基础操作中复制并返回结果。这些生成的内核可以在<gen-out>/aten/src/ATen/CompositeViewCopyKernels.cpp中找到。<br>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;同时请注意，对于添加到native_functions.yaml中的新操作符，如果它们满足上述要求，则应该包含autogen关键字，因为函数化依赖于它。我们将在代码生成过程中强制执行这一点。<br>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
