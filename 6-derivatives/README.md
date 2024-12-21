@@ -125,7 +125,9 @@
 # 12 命名的一致性
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;**NB: The parameter names here MUST be consistent with the parameter names in native_functions.yaml** <br>
 
-
+# 13 生成的反向传播函数声明和定义
+- */pytorch/torch/csrc/autograd/generated/Functions.h
+- */pytorch/torch/csrc/autograd/generated/Functions.cpp
 
 
 
