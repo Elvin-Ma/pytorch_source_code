@@ -11,7 +11,7 @@ pytorch source code introduce and analysis
 referece: [pytorch README.md]()
 
 # 架构
-
+```python
 ├── android: 用于构建android应用程序
 ├── aten: A Tensor Library，pytorch的C++ tensor 库,实现了tensor的运算 (不支持自动梯度)，大部分op都可以在此找到，Aten的op实现分为两种;1. native op：op的现代C++实现 2. legacy op(TH, THC, THCUNN):原torch遗留下来的op的传统C语言实现,不要在里面添加新的op,这部分正在慢慢转移到native中
 │  └── conda:包含了conda构建使用的脚本以及配置文件
@@ -83,3 +83,4 @@ referece: [pytorch README.md]()
 │  └── nn:torch.nn模块
 │  └── optim:torch.optim模块
 │  └── distributed:torch. distributed模块
+```
