@@ -49,15 +49,15 @@
 3. **result** <br>
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;**评估ATen原生函数声明的正向表达式的结果**。如果正向表达式输出一个元组，则使用"resultX" 来访问第X个条目。<br>
 
-4. **grad_input_mask**
+4. **grad_input_mask** <br>
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;一个std::array<bool, n>类型，用于指定哪些输入的梯度是实际需要的。例如，在条目input0, input1: foo(grad_input_mask)中，grad_input_mask是一个大小为二的数组，其中grad_input_mask[0]为true表示input0需要梯度，grad_input_mask[1]为true表示input1需要梯度。<br>
 
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;如果你的函数为一系列张量计算梯度，那么grad_input_mask将只为这个列表有一个条目，用于指定列表中是否有零个或至少一个张量需要梯度。如果我们想要支持更精细的信号传递，我们将需要一个不是std::array类型的替代变量。<br>
 
-5. **retain_variables**
+5. **retain_variables** <br>
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;一个布尔值，如果用户指定了在之后可能**再次进行反向传播**时应保留已保存的变量，则该值为true。这允许一种优化：如果我们知道变量不会被保留，就可以销毁已保存的缓冲区。例如，_cudnn_rnn就使用了这种优化。<br>
 
-6. **wrap_opt_if**
+6. **wrap_opt_if** <br>
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;是一个接受两个参数的函数，第一个参数是一个张量变量，第二个参数是一个布尔条件，用于指示**是否应在图中保存该变量**。<br>
 
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;这个函数的返回类型是std::optional<Tensor>，当条件评估为false时，返回::std::nullopt；否则，返回被std::optional<Tensor>包装的variable。<br>
