@@ -390,6 +390,8 @@ inline at::Tensor & add_outf(const at::Tensor & self, const at::Scalar & other, 
 - TORCH_META_FUNC2 和 TORCH_IMPL_FUNC 对sub_out 的使用都在：<br>
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; */pytorch/aten/src/ATen/native/BinaryOps.cpp
 
+*(注意：TORCH_IMPL_FUNC 和 TORCH_META_FUNC 是各后端公用的，不需要为新后端重新注写一套，但需要为新后端重新生成RegisterBACKEND.cpp, 这是自动生成的，代码很类似)* <br>
+
 ## 2.3 在调用时stub 时可能会调用其他算子的stub
 - sub_out 里调用的是add_sub, 因此sub_out 算子不需要注册
 ```c++
