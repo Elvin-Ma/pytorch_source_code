@@ -409,6 +409,266 @@ return offset_and_mask.offset + backend_idx;
 
 **至此我们可以较为清晰的看到注册流程，深入的分析请看2-ops_dispatcher** <br>
 
-# 3 参考文档
+# 3 各函数的注册处
+
+## 3.1 first important registration
+- [macro definition](torch/include/torch/library.h)
+- [CPU op registration](build/aten/src/ATen/RegisterCPU.cpp)
+- [Meta op registration](build/aten/src/ATen/RegisterMeta.cpp)
+- [Autograd op registration](torch/csrc/autograd/generated/VariableType_4.cpp)
+- [AutogradCUDA op registration](torch/csrc/autograd/generated/VariableType_*.cpp)
+- [CUDA op registration](build/aten/src/ATen/RegisterCUDA.cpp)
+
+
+## 3.2 autocast amp 相关注册
+**通过设置dispatchkey 的exclude 来dispatch到amp算子上**<br>
+- [autocast op registration](aten/src/ATen/autocast_mode.cpp)
+- [AutocastMPS op registration](aten/src/ATen/autocast_mode.cpp)
+- [AutocastCPU op registration](aten/src/ATen/autocast_mode.cpp)
+- [AutocastXPU op registration](aten/src/ATen/autocast_mode.cpp)
+- [autocast op registration](aten/src/ATen/autocast_mode.cpp)
+- [autocast op registration](aten/src/ATen/autocast_mode.cpp)
+- [autocast op registration](aten/src/ATen/autocast_mode.cpp)
+- [autocast op registration](aten/src/ATen/autocast_mode.cpp)
+
+## 3.3 合成算子注册 Composite op <br>
+```python
+# CompositeImplicitAutograd 是 PyTorch 自动微分系统中的一种机制，用于处理自定义算子的反向传播逻辑。
+# 与 CompositeExplicitAutogradNonFunctional 不同，
+# CompositeImplicitAutograd 表示一个算子在所有情况下都天然支持反向处理，并且其反向传播逻辑可以通过 PyTorch 的标准自动微分系统自动生成。
+
+# CompositeExplicitAutograd
+# 用途：
+# CompositeExplicitAutograd 用于声明一个算子，该算子需要显式地为其定义反向传播逻辑。
+# 这通常用于复杂的算子，这些算子不能通过简单的元素级操作或现有的自动微分规则来自动推导其梯度。
+# 反向传播逻辑：
+# 当使用 CompositeExplicitAutograd 时，开发者需要在 derivatives.yaml 文件中为相应的算子显式地指定反向传播函数。
+# 这允许开发者完全控制反向传播过程中梯度的计算方式。
+# 应用场景：
+# 这种机制通常用于实现那些内部包含多个子步骤或复杂数学运算的算子，这些子步骤或运算需要特定的梯度处理逻辑。
+
+#CompositeExplicitAutogradNonFunctional 是一个与 PyTorch 内部实现相关的概念，
+# 它可能用于指示某些自定义算子不应该通过标准的自动微分路径（即自动生成 C++ 反向传播代码）来处理。
+# 这个标记或机制的具体行为和可用性可能依赖于 PyTorch 的版本和实现细节，因此在不同的 PyTorch 版本或分支中可能会有所不同。
+# torch.autograd.Function 是 PyTorch 提供的一个高级接口，用于定义自定义的自动梯度计算。
+# 通过继承 torch.autograd.Function 类并重写其 forward 和 backward 方法，开发者可以实现自定义算子的正向和反向传播逻辑。
+```
+- [CompositeImplicitAutograd op registration](build/aten/src/ATen/RegisterCompositeImplicitAutograd.cpp)
+- [CompositeExplicitAutograd op registration](build/aten/src/ATen/RegisterCompositeExplicitAutograd.cpp)
+- [CompositeExplicitAutogradNonFunctional op registration](build/aten/src/ATen/RegisterCompositeExplicitAutogradNonFunctional.cpp)
+- [RegisterCompositeImplicitAutogradNestedTensor op registration](build/aten/src/ATen/RegisterCompositeImplicitAutogradNestedTensor.cpp)
+
+## 3.4 量化相关注册QuantizedMeta op
+- [QuantizedCPU op registration](build/aten/src/ATen/RegisterQuantizedCPU.cpp)
+- [QuantizedCUDA op registration](build/aten/src/ATen/RegisterQuantizedCUDA.cpp)
+- [QuantizedMeta op registration](build/aten/src/ATen/RegisterQuantizedMeta.cpp)
+- [cuda quantization op registration](torch/csrc/distributed/c10d/quantization/quantization_gpu.cu)
+- [cpu quantization op registration](torch/csrc/distributed/c10d/quantization/quantization.cpp)
+- [Quantized CPU / QuantizedCPU registration](aten/src/ATen/native/quantized/cpu/*.cpp) 
+- [Quantized CUDA registration](aten/src/ATen/native/quantized/cuda/*.cu)
+- [Quantized CUDA registration](aten/src/ATen/native/quantized/cudnn/*.cpp)
+- [Quantized Meta registration](aten/src/ATen/native/quantized/cpu/*.cpp)
+
+
+## 3.5 FullbackKernel
+- [Functionalize FallbackKernel registration](aten/src/ATen/FunctionalizeFallbackKernel.cpp)
+- [ZeroTensorFallbackKernel registration](aten/src/ATen/ZeroTensorFallback.cpp)
+- [Conjugate op Fallback](aten/src/ATen/ConjugateFallback.cpp)
+- [BackendSelect Fallthough](aten/src/ATen/core/BackendSelectFallbackKernel.cpp)
+- [Python Fallback](aten/src/ATen/core/PythonFallbackKernel.cpp)
+- [Python PythonDispatcher Fallback](aten/src/ATen/core/PythonFallbackKernel.cpp)
+- [Python PythonTLSSnapshot Fallback](aten/src/ATen/core/PythonFallbackKernel.cpp)
+- [Python PreDispatch Fallback](aten/src/ATen/core/PythonFallbackKernel.cpp)
+- [Meta Fallback](aten/src/ATen/core/MetaFallbackKernel.cpp)
+- [MPS Fallback](aten/src/ATen/mps/MPSFallback.mm)
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;**下列都fallback到Autograd上** <br>
+- [AutogradOther Fallback](aten/src/ATen/core/VariableFallbackKernel.cpp) 
+- [AutogradCPU Fallback](aten/src/ATen/core/VariableFallbackKernel.cpp) 
+- [AutogradXPU Fallback](aten/src/ATen/core/VariableFallbackKernel.cpp) 
+- [AutogradCUDA Fallback](aten/src/ATen/core/VariableFallbackKernel.cpp) 
+- [AutogradXLA Fallback](aten/src/ATen/core/VariableFallbackKernel.cpp) 
+- [AutogradLazy Fallback](aten/src/ATen/core/VariableFallbackKernel.cpp) 
+- [AutogradMPS Fallback](aten/src/ATen/core/VariableFallbackKernel.cpp) 
+- [ADInplaceOrView Fallback](aten/src/ATen/core/VariableFallbackKernel.cpp) 
+- [AutogradHPU Fallback](aten/src/ATen/core/VariableFallbackKernel.cpp) 
+
+## 3.6 CatchAll
+- [sparse CatchAll](aten/src/ATen/native/ao_sparse/quantized/cpu/qlinear_unpack.cpp)
+- [quantized CatchAll](aten/src/ATen/native/RNN.cpp)
+- [quantized CatchAll](aten/src/ATen/native/quantized/qlinear_unpack.cpp)
+
+## 3.7 通信算子的注册
+- [communicate op registration](torch/csrc/distributed/c10d/Ops.cpp)
+
+**step1 : 函数通过宏来实现** <br>
+```c++
+// Return input tensors as output tensors to make inplace allreduce look like
+// a functional API, so that make_fx can correctly build the dependencies in
+// the graph later.
+#define IMPL_ALLREDUCE(DEV)                                                   \
+  std::tuple<std::vector<at::Tensor>, c10::intrusive_ptr<Work>>               \
+      allreduce_##DEV(                                                        \
+          at::TensorList tensors,                                             \
+          const c10::intrusive_ptr<ProcessGroup>& process_group,              \
+          const c10::intrusive_ptr<ReduceOp>& reduce_op,                      \
+          const std::optional<at::Tensor>& sparse_indices,                    \
+          int64_t timeout) {                                                  \
+    auto tensor_vec = tensors.vec();                                          \
+    auto work = process_group->getBackend(c10::DeviceType::DEV) -> allreduce( \
+        tensor_vec,                                                           \
+        AllreduceOptions{                                                     \
+            *reduce_op.get(), std::chrono::milliseconds(timeout)});           \
+    return std::tuple<std::vector<at::Tensor>, c10::intrusive_ptr<Work>>(     \
+        std::move(tensor_vec), work);                                         \
+  }
+
+IMPL_ALLREDUCE(CPU)
+IMPL_ALLREDUCE(CUDA)
+IMPL_ALLREDUCE(PrivateUse1)
+```
+
+**step2 : 注册** <br>
+```c++
+#define REGISTER_C10D_OP1(FUNC, DEV) \
+  TORCH_LIBRARY_IMPL(c10d, DEV, m) { \
+    m.impl(#FUNC, FUNC##DEV);        \
+  }
+
+// 1st level expansion
+#define REGISTER_C10D_OP(FUNC)  \
+  REGISTER_C10D_OP1(FUNC, CPU)  \
+  REGISTER_C10D_OP1(FUNC, CUDA) \
+  REGISTER_C10D_OP1(FUNC, PrivateUse1)
+
+REGISTER_C10D_OP(allreduce_)
+```
+
+## 3.8 Other important registrations
+- [Named dispatch registration](aten/src/ATen/core/NamedRegistrations.cpp) // 调度到下一个可用的dispatch
+- [AutogradNestedTensor op registration](torch/csrc/autograd/generated/VariableType_*.cpp)
+- [autograd InplaceOrView Op registration](torch/csrc/autograd/generated/ADInplaceOrViewType_1.cpp)
+- [VariableTypeManual autograd registration](torch/csrc/autograd/VariableTypeManual.cpp)
+- [VariableTypeManual ADInplaceOrView registration](torch/csrc/autograd/VariableTypeManual.cpp)
+- [CPUCustomType op registration](build/out/RegisterCPUCustomOps.cpp)
+- [Negative op registration](aten/src/ATen/native/NegateFallback.cpp)
+- [Cathch all ops](torch/csrc/jit/runtime/register_distributed_ops.cpp)
+- [inductor functionalize](torch/csrc/inductor/resize_storage_bytes.cpp)
+- [aten trace](torch/csrc/autograd/generated/TraceType_1.cpp)
+- [aten trace](torch/csrc/autograd/TraceTypeManual.cpp)
+- [BackendSelect](build/aten/src/ATen/RegisterBackendSelect.cpp)
+- [ZeroTensor op registration](build/aten/src/ATen/RegisterZeroTensor.cpp)
+- [prepacked cpu](aten/src/ATen/native/xnnpack/RegisterOpContextClass.cpp)
+- [BatchedTensor Implement](aten/src/ATen/LegacyBatchingRegistrations.cpp)
+
+## 3.9 NestedTensor : 还在原型阶段<br>
+```python
+a, b = torch.arange(3), torch.arange(5) + 3
+nt = torch.nested.nested_tensor([a, b])
+```
+- [NestedTensorCUDA op registration](build/aten/src/ATen/RegisterNestedTensorCUDA.cpp)
+- [NestedTensorMeta op registration](build/aten/src/ATen/RegisterNestedTensorMeta.cpp)
+- [NestedTensorCPU op registration](build/aten/src/ATen/RegisterNestedTensorCPU.cpp)
+
+## 3.10 Functionalize
+```python
+在 PyTorch 中，DispatchKey 是用于定义操作在不同后端（如 CPU、CUDA、XLA 等）上如何执行的一种机制。functionalize 是与 PyTorch 的 Autograd 系统和图形转换相关的一个概念，特别是在将计算图从急切执行模式（eager execution mode）转换为图执行模式（graph execution mode）时起作用。
+
+具体来说，functionalize 是指在将 PyTorch 的计算图转换为更容易优化和执行的形式时，将原始代码中的就地操作（in-place operations）和带有副作用的操作替换为纯函数式操作的过程。这种转换有助于确保计算图中的所有操作都是无状态的，并且可以安全地进行各种优化，如自动微分、梯度累积、图优化等。
+
+在 PyTorch 的内部实现中，特别是在使用 torch.autograd.graph.Functionalize 类时，functionalize 的作用包括但不限于：
+
+消除就地操作：将如 x += y 的就地操作替换为 x = x + y 的形式，以确保每次操作都返回一个新的张量，而不是修改现有的张量。
+处理控制流：将 Python 的控制流结构（如 if 语句和 for 循环）转换为可以在图执行模式下更高效执行的等效形式。
+优化梯度计算：通过消除计算图中的冗余操作和重新排列操作顺序，来优化反向传播过程中梯度的计算。
+支持动态图到静态图的转换：在将动态计算图（eager graph）转换为静态计算图（static graph）时，functionalize 是关键步骤之一，使得转换后的图可以在不同的后端上高效执行。
+总之，functionalize 在 PyTorch 中主要用于确保计算图的可优化性和后端执行的高效性，通过将就地操作和带有副作用的操作转换为纯函数式操作，为进一步的图优化和执行提供了基础。这在 PyTorch 的高性能计算和自动微分系统中扮演着重要角色。
+```
+- [Functionalize op registration](build/aten/src/ATen/RegisterFunctionalization_*.cpp)
+- [Functionalize op registration](build/aten/src/ATen/RegisterFunctionalizationEverything.cpp)
+
+
+## 3.11 SparseTensor
+```python
+SparseCsr key 对应于使用压缩稀疏行（Compressed Sparse Row，简称 CSR）格式存储的稀疏张量（Sparse Tensor）的情况。
+CSR 是一种高效的稀疏矩阵存储格式，特别适用于那些非零元素相对较少且分布不规则的矩阵。
+```
+- [SparseCPU op registration](build/aten/src/ATen/RegisterSparseCPU.cpp)
+- [SparseCUDA op registration](build/aten/src/ATen/RegisterSparseCUDA.cpp)
+- [SparseCsrCUDA op registration](build/aten/src/ATen/RegisterSparseCsrCUDA.cpp)
+- [SparseCsrMeta op registration](build/aten/src/ATen/RegisterSparseCsrMeta.cpp)
+- [sparse QuantizedCPU](aten/src/ATen/native/ao_sparse/quantized/cpu/qlinear.cpp)
+- [sparse QuantizedCPU](aten/src/ATen/native/ao_sparse/quantized/cpu/qlinear_prepack.cpp)
+- [sparse CPU](aten/src/ATen/native/ao_sparse/quantized/cpu/qlinear_dynamic.cpp)
+
+## 3.12 functorch
+```python
+# functorch 是一个 PyTorch 的扩展库，它提供了一个可微分的张量库，并利用 PyTorch 的自动微分系统来实现自动化的函数变换。Functorch 是一个强大的工具，对于需要进行复杂微分计算和函数变换的深度学习研究者和开发者非常有用。
+# 与 Google JAX 类似，functorch 是 PyTorch 中的一个库，提供可组合的 vmap（矢量化）和 autodiff 转换。
+# 它支持高级的 autodiff 用例（在 PyTorch 中难以表达），包括：
+# 
+# 1. 模型集成 model ensembling
+# 
+# 2. 高效计算 Jacobian 和 Hessians
+# 
+# 3. 计算 per-sample-gradients 或其他 per-sample quantities
+```
+- [FuncTorchBatched registration](aten/src/ATen/functorch/Batch*.cpp)
+- [FuncTorchGradWrapper registration](aten/src/ATen/functorch/*.cpp)
+- [FuncTorchVmapMode registration](aten/src/ATen/functorch/*.cpp)
+- [FuncTorchDynamicLayerFrontMode registration](aten/src/ATen/functorch/*.cpp)
+- [FuncTorchDynamicLayerBackMode registration](aten/src/ATen/functorch/*.cpp)
+
+## 3.13 Metal 相关算子
+```python
+# Metal 主要由 Apple 开发，并在其 macOS、iOS、tvOS 和 watchOS 等操作系统上得到支持。
+# 当开发者需要在这些平台上运行 PyTorch 模型时，Metal dispatch key 就变得尤为重要。
+# 它允许 PyTorch 模型利用 Metal 的高性能计算能力，实现跨平台的无缝计算。
+
+# 另外：
+# MPS（Metal Performance Shaders）对应于苹果公司的Metal图形API的后端，特别是在PyTorch等深度学习框架的上下文中。
+# MPS是苹果公司为其硬件（特别是GPU）提供的一套高性能着色器和计算库，旨在加速图形渲染和通用计算任务。
+```
+- [Metal op registration](aten/src/ATen/native/metal/ops/Metal*.mm)
+- [MPS Fallback](aten/src/ATen/mps/MPSFallback.mm)
+
+## 3.14 mkldnn 相关算子
+```python
+# 一、MKLDNN简介
+# MKLDNN是一个深度学习底层库，主要针对英特尔处理器、英特尔图形处理器以及Xe图形处理器，对深度神经网络进行op级以及指令集级的优化。
+# 它能够成倍地提升神经网络在Intel CPU以及GPU下的推理速度，并大大简化了复杂神经网络的设计与实现过程。
+
+# 二、MKLDNN的核心特性
+# 高度优化：MKLDNN通过高度优化的算法，确保了计算资源的有效利用。它针对英特尔硬件平台进行了深度优化，能够充分发挥Intel CPU和GPU的性能。
+# 开放性和兼容性：MKLDNN能够很好地与其他流行深度学习平台如TensorFlow、PyTorch或Caffe等协同工作。
+# 这意味着开发者可以根据自身偏好自由选择最适合的开发环境，同时享受MKLDNN带来的性能增益。
+# 多线程与多核处理：MKLDNN支持多线程与多核处理，这对于处理大规模数据集尤为重要。
+# 通过并行计算，MKLDNN能够充分利用现代计算机中的多核处理器，进一步提升计算效率。
+# 层融合技术：MKLDNN提供了层融合技术，以加速推理时间。通过将这些带宽限制型op与计算密集型op或者其它op进行融合，可以减小计算量并提高推理速度。
+```
+- [mkldnn op registration](aten/src/ATen/native/mkldnn/Linear.cpp)
+
+## 3.15 Vulkan 相关算子
+```python
+# 在 PyTorch 中，dispatch Vulkan 主要指的是利用 Vulkan 图形和计算 API 来加速深度学习模型的推理和训练过程。
+# Vulkan 是一种跨平台的图形和计算 API，它提供了对现代 GPU 的低级访问，并允许开发者更直接地控制硬件资源，从而实现高性能计算。
+# 
+# Vulkan Dispatch 在 PyTorch 中的应用
+# 高性能计算：
+# Vulkan 提供了高效的并行计算能力，这使得它成为加速深度学习模型推理和训练的理想选择。
+# 通过利用 Vulkan 的低级访问和硬件加速功能，PyTorch 可以实现更快速的算子执行和更高的吞吐量。
+# 跨平台支持：
+# Vulkan 是一种跨平台的 API，这意味着它可以在多种操作系统和设备上运行。
+# 这为 PyTorch 提供了更广泛的兼容性，使得开发者可以在不同的硬件平台上利用 Vulkan 的性能优势。
+# 自定义算子支持：
+# 对于需要在 Vulkan 上执行自定义算子的开发者来说，PyTorch 提供了必要的支持。
+# 开发者可以通过 PyTorch 的自定义算子接口实现并注册支持 Vulkan 的算子，从而扩展 PyTorch 的功能并优化性能。
+# 与硬件的紧密集成：
+# Vulkan 与现代 GPU 硬件紧密集成，能够充分利用设备的硬件加速功能。
+# 通过 Vulkan dispatch，PyTorch 可以更高效地利用这些硬件加速功能，提高算子执行的效率和速度。
+```
+- [vulkan op registration](aten/src/ATen/native/vulkan/ops/*.cpp)
+
+
+# 4 参考文档
 - [pytorch Registering a Dispatched Operator in C++](https://pytorch.org/tutorials/advanced/dispatcher.html)
 - [PyTorch Custom Operators](https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html#custom-ops-landing-page)
