@@ -497,7 +497,43 @@ return offset_and_mask.offset + backend_idx;
 - [quantized CatchAll](aten/src/ATen/native/RNN.cpp)
 - [quantized CatchAll](aten/src/ATen/native/quantized/qlinear_unpack.cpp)
 
-## 3.7 通信算子的注册
+## 3.7 ADInplaceOrView op
+- [ADInplaceOrView Op registration](torch/csrc/autograd/generated/ADInplaceOrViewType_1.cpp)
+```python
+#这段注释详细解释了ADInplaceOrView这个dispatch key在PyTorch中的用途和背后的设计理念。下面是对这段注释的解读：
+#
+# ADInplaceOrView key的作用
+# ADInplaceOrView key主要用于原地（inplace）操作或view操作（不改变数据但改变tensor形状的操作）来注册一个特殊的kernel。
+# 这个kernel负责为未来的自动微分（autograd）计算做一些额外的设置工作。
+#
+#对于原地操作：
+# 这个kernel会执行版本更新（version bump）。在PyTorch中，原地操作会修改tensor的内容，这可能导致自动微分系统在计算梯度时遇到一些挑战，
+# 因为梯度需要正确地回溯到修改前的状态。版本更新机制就是用来解决这个问题的。
+
+# 对于view操作：
+# 这个kernel会设置DifferentiableViewMeta，这是为了确保view tensor能够正确地参与自动微分计算。
+# 在PyTorch中，view操作不会复制数据，而是创建一个新的tensor视图，这个视图与原tensor共享数据。
+# 但是，在自动微分时，我们需要知道哪些tensor是通过view操作创建的，以便正确地处理它们。
+
+# 对于其他操作
+# 对于不是原地操作也不是view操作的其他操作，这个kernel是一个直通（fallthrough）kernel，即它不做任何额外的工作。
+# 这是因为这些操作不需要为自动微分计算做额外的设置。
+#
+# 理想世界中的设计（Dream部分）
+#注释中还提到了一个理想的设计方案，即在一个理想的世界中，我们可以为requires_grad=false的输入跳过VariableType kernel（这是PyTorch中处理tensor的一个核心部分，负责很多tensor的操作和自动微分的支持）。
+# 但是，由于这会给所有操作增加一个额外的dispatch（分发）开销，并且在模型级别上会带来非微不足道的性能损失（几个百分点），因此这个方案目前被阻塞了。
+#
+# 当前的设计方案
+# 当前的设计方案利用了这样一个事实：每个kernel都会首先通过VariableType kernel。
+# 因此，他们将at::AutoDispatchBelowADInplaceOrView guard（一个用于控制dispatch行为的机制）上移到了VariableType kernel中。
+# 这样，他们只对view/inplace操作添加了额外的dispatch，以最小化对实际模型性能的影响。
+#
+#总结
+# 这段注释不仅解释了ADInplaceOrView key的用途，还揭示了PyTorch在设计自动微分系统时面临的一些挑战和权衡。
+# 通过理解这些设计决策，我们可以更好地理解和使用PyTorch的自动微分功能。
+```
+
+## 3.8 通信算子的注册
 - [communicate op registration](torch/csrc/distributed/c10d/Ops.cpp)
 
 **step1 : 函数通过宏来实现** <br>
@@ -543,10 +579,9 @@ IMPL_ALLREDUCE(PrivateUse1)
 REGISTER_C10D_OP(allreduce_)
 ```
 
-## 3.8 Other important registrations
+## 3.9 Other important registrations
 - [Named dispatch registration](aten/src/ATen/core/NamedRegistrations.cpp) // 调度到下一个可用的dispatch
 - [AutogradNestedTensor op registration](torch/csrc/autograd/generated/VariableType_*.cpp)
-- [autograd InplaceOrView Op registration](torch/csrc/autograd/generated/ADInplaceOrViewType_1.cpp)
 - [VariableTypeManual autograd registration](torch/csrc/autograd/VariableTypeManual.cpp)
 - [VariableTypeManual ADInplaceOrView registration](torch/csrc/autograd/VariableTypeManual.cpp)
 - [CPUCustomType op registration](build/out/RegisterCPUCustomOps.cpp)
@@ -560,7 +595,7 @@ REGISTER_C10D_OP(allreduce_)
 - [prepacked cpu](aten/src/ATen/native/xnnpack/RegisterOpContextClass.cpp)
 - [BatchedTensor Implement](aten/src/ATen/LegacyBatchingRegistrations.cpp)
 
-## 3.9 NestedTensor : 还在原型阶段<br>
+## 3.10 NestedTensor : 还在原型阶段<br>
 ```python
 a, b = torch.arange(3), torch.arange(5) + 3
 nt = torch.nested.nested_tensor([a, b])
@@ -569,7 +604,7 @@ nt = torch.nested.nested_tensor([a, b])
 - [NestedTensorMeta op registration](build/aten/src/ATen/RegisterNestedTensorMeta.cpp)
 - [NestedTensorCPU op registration](build/aten/src/ATen/RegisterNestedTensorCPU.cpp)
 
-## 3.10 Functionalize
+## 3.11 Functionalize
 ```python
 在 PyTorch 中，DispatchKey 是用于定义操作在不同后端（如 CPU、CUDA、XLA 等）上如何执行的一种机制。functionalize 是与 PyTorch 的 Autograd 系统和图形转换相关的一个概念，特别是在将计算图从急切执行模式（eager execution mode）转换为图执行模式（graph execution mode）时起作用。
 
@@ -587,7 +622,7 @@ nt = torch.nested.nested_tensor([a, b])
 - [Functionalize op registration](build/aten/src/ATen/RegisterFunctionalizationEverything.cpp)
 
 
-## 3.11 SparseTensor
+## 3.12 SparseTensor
 ```python
 SparseCsr key 对应于使用压缩稀疏行（Compressed Sparse Row，简称 CSR）格式存储的稀疏张量（Sparse Tensor）的情况。
 CSR 是一种高效的稀疏矩阵存储格式，特别适用于那些非零元素相对较少且分布不规则的矩阵。
@@ -600,7 +635,7 @@ CSR 是一种高效的稀疏矩阵存储格式，特别适用于那些非零元�
 - [sparse QuantizedCPU](aten/src/ATen/native/ao_sparse/quantized/cpu/qlinear_prepack.cpp)
 - [sparse CPU](aten/src/ATen/native/ao_sparse/quantized/cpu/qlinear_dynamic.cpp)
 
-## 3.12 functorch
+## 3.13 functorch
 ```python
 # functorch 是一个 PyTorch 的扩展库，它提供了一个可微分的张量库，并利用 PyTorch 的自动微分系统来实现自动化的函数变换。Functorch 是一个强大的工具，对于需要进行复杂微分计算和函数变换的深度学习研究者和开发者非常有用。
 # 与 Google JAX 类似，functorch 是 PyTorch 中的一个库，提供可组合的 vmap（矢量化）和 autodiff 转换。
@@ -618,7 +653,7 @@ CSR 是一种高效的稀疏矩阵存储格式，特别适用于那些非零元�
 - [FuncTorchDynamicLayerFrontMode registration](aten/src/ATen/functorch/*.cpp)
 - [FuncTorchDynamicLayerBackMode registration](aten/src/ATen/functorch/*.cpp)
 
-## 3.13 Metal 相关算子
+## 3.14 Metal 相关算子
 ```python
 # Metal 主要由 Apple 开发，并在其 macOS、iOS、tvOS 和 watchOS 等操作系统上得到支持。
 # 当开发者需要在这些平台上运行 PyTorch 模型时，Metal dispatch key 就变得尤为重要。
@@ -631,7 +666,7 @@ CSR 是一种高效的稀疏矩阵存储格式，特别适用于那些非零元�
 - [Metal op registration](aten/src/ATen/native/metal/ops/Metal*.mm)
 - [MPS Fallback](aten/src/ATen/mps/MPSFallback.mm)
 
-## 3.14 mkldnn 相关算子
+## 3.15 mkldnn 相关算子
 ```python
 # 一、MKLDNN简介
 # MKLDNN是一个深度学习底层库，主要针对英特尔处理器、英特尔图形处理器以及Xe图形处理器，对深度神经网络进行op级以及指令集级的优化。
@@ -647,7 +682,7 @@ CSR 是一种高效的稀疏矩阵存储格式，特别适用于那些非零元�
 ```
 - [mkldnn op registration](aten/src/ATen/native/mkldnn/Linear.cpp)
 
-## 3.15 Vulkan 相关算子
+## 3.16 Vulkan 相关算子
 ```python
 # 在 PyTorch 中，dispatch Vulkan 主要指的是利用 Vulkan 图形和计算 API 来加速深度学习模型的推理和训练过程。
 # Vulkan 是一种跨平台的图形和计算 API，它提供了对现代 GPU 的低级访问，并允许开发者更直接地控制硬件资源，从而实现高性能计算。
