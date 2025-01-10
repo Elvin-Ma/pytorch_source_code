@@ -160,6 +160,14 @@ class ElasticAgent(abc.ABC):
 - LocalElasticAgent 派生了SimpleElasticAgent ，是目前弹性训练最终使用的代理，主要用于在本地进行操作，负责管理单机上所有的worker进程。
 
 # 3 Worker
+Worker 类代表了一个worker实例，我们上文介绍了WorkerSpec，Worker 就是依据 WorkerSpec 构建出来的，其重点成员变量如下：<br>
+
+- id（任意）：唯一标识一个worker，具体是由ElasticAgent的特定实现来解释，对于本地代理，它可以是worker的pid（int），对于远程代理，它可以被编码为``host:port（string）`。<br>
+- local_rank ：worker的local rank。<br>
+- global_rank：worker的global rank。<br>
+- role_rank：具有相同角色的所有worker的rank。<br>
+- world_size：全局worker数量。<br>
+- role_world_size：具有相同角色的worker数量。<br>
 
 
 
