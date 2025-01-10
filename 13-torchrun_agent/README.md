@@ -30,45 +30,136 @@ Rendezvous 被Torch Distributed Elastic用来收集一个训练job的参与者�
 
 ```python
 if action == _Action.FINISH:
-                continue
+    continue
 
-            if action == _Action.ERROR_CLOSED:
-                raise RendezvousClosedError
+    if action == _Action.ERROR_CLOSED:
+        raise RendezvousClosedError
 
-            if action == _Action.ERROR_TIMEOUT:
-                raise RendezvousTimeoutError
+    if action == _Action.ERROR_TIMEOUT:
+        raise RendezvousTimeoutError
 
-            if action == _Action.SYNC:
-                # Delay the execution by one second to avoid overloading the
-                # backend if we are asked to poll for state changes.
-                _delay(seconds=1)
-            else:
-                if action == _Action.KEEP_ALIVE:
-                    self._keep_alive()
-                elif action == _Action.ADD_TO_PARTICIPANTS:
-                    self._add_to_participants()
-                elif action == _Action.ADD_TO_WAIT_LIST:
-                    self._add_to_wait_list()
-                elif action == _Action.ADD_TO_REDUNDANCY_LIST:
-                    self._add_to_redundancy_list()
-                elif action == _Action.REMOVE_FROM_PARTICIPANTS:
-                    self._remove_from_participants()
-                elif action == _Action.REMOVE_FROM_WAIT_LIST:
-                    self._remove_from_wait_list()
-                elif action == _Action.REMOVE_FROM_REDUNDANCY_LIST:
-                    self._remove_from_redundancy_list()
-                    # update deadline since the node may participate in rendezvous process
-                    if update_deadline:
-                        deadline = update_deadline(self._settings.timeout.join)
-                elif action == _Action.MARK_RENDEZVOUS_COMPLETE:
-                    self._mark_rendezvous_complete()
-                elif action == _Action.MARK_RENDEZVOUS_CLOSED:
-                    self._mark_rendezvous_closed()
+    if action == _Action.SYNC:
+        # Delay the execution by one second to avoid overloading the
+        # backend if we are asked to poll for state changes.
+        _delay(seconds=1)
+    else:
+        if action == _Action.KEEP_ALIVE:
+            self._keep_alive()
+        elif action == _Action.ADD_TO_PARTICIPANTS:
+            self._add_to_participants()
+        elif action == _Action.ADD_TO_WAIT_LIST:
+            self._add_to_wait_list()
+        elif action == _Action.ADD_TO_REDUNDANCY_LIST:
+            self._add_to_redundancy_list()
+        elif action == _Action.REMOVE_FROM_PARTICIPANTS:
+            self._remove_from_participants()
+        elif action == _Action.REMOVE_FROM_WAIT_LIST:
+            self._remove_from_wait_list()
+        elif action == _Action.REMOVE_FROM_REDUNDANCY_LIST:
+            self._remove_from_redundancy_list()
+            # update deadline since the node may participate in rendezvous process
+            if update_deadline:
+                deadline = update_deadline(self._settings.timeout.join)
+        elif action == _Action.MARK_RENDEZVOUS_COMPLETE:
+            self._mark_rendezvous_complete()
+        elif action == _Action.MARK_RENDEZVOUS_CLOSED:
+            self._mark_rendezvous_closed()
 
-                # Attempt to sync our changes back to other nodes.
-                self._state_holder.mark_dirty()
+        # Attempt to sync our changes back to other nodes.
+        self._state_holder.mark_dirty()
 ```
 
+# 2 Agent 总体逻辑
+## 2.1 功能
+Elastic agent 是 torchelastic 的控制台（control plane），**Elastic agent是一个独立进程，负责启动和管理底层 worker 进程**，代理具体负责：<br>
+- 与PyTorch原生分布式协同工作：使每个worker都能获得所有需要的信息，以便成功调用**torch.distributed.init_process_group()**; <br>
+- 容错：监控每个worker，当出现错误或者异常时能及时**终止所有worker并重启它们**; <br>
+- 弹性：对成员更改作出反应，并**使用新的成员来重启所有workers**; <br>
+
+## 2.2 工作基础
+Torchelastic agent 和 用户 worker 依据故障切换契约来工作：<br>
+- TE（torchelastic）希望用户worker以**5分钟为误差**完成工作。<br>
+- 设计**DDP**应用程序时，**最好让所有worker都失败，而不只是一个worker失败**。<br>
+- TE不会在代理之间同步重启次数(重启次数谁管谁的)。<br>
+- TE **re-rendezvous不会减少重启次数(不会减少剩余重启次数)**。<br>
+- 当单个代理完成其工作（成功或失败）时，它将**关闭rendezvous**。如果其他代理仍有worker在工作，他们将被**终止**。<br>
+- 基于上述情况，如果至少有一个代理完成了任务，则缩容(scale down)**不起作用**。<br>
+- 当代理检测到Scale up时，它不会减少 "max_restarts" (属于正常restart, 不会降低重启次数)。<br>
+- Torchelast agent 之间通过etcd或者类似后端来保持协同工作。<br>
+
+*注释：etcd是一个高可用的分布式键值存储系统，主要用于存储配置信息、服务发现、协调以及其他需要高度可用性的场景。* <br>
+
+## 2.4 agent 有多种配置方式
+
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;单的agent部署在每个节点上，并与本地进程协同工作。更高级的agent可以远程启动和管理workers。Agent可以做到彻底的去中心化，与其他agents（管理同一个job的workers）进行沟通协调做出一个集体性决策，决策是基于其管理的 workers 情况来完成。对于如何配置，源码中也给出了示例，如果在GPU上启动训练一个拥有 8 个 trainer（每GPU一个trainer）的 job，我们可以做如下可能的配置: <br>
+
+```python
+1. Use 8 x single GPU instances, place an agent per instance, managing 1 worker per agent.
+2. Use 4 x double GPU instances, place an agent per instance, managing 2 workers per agent.
+3. Use 2 x quad GPU instances, place an agent per instance, managing 4 workers per agent.
+4. Use 1 x 8 GPU instance, place an agent per instance, managing 8 workers per agent.
+```
+
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;基类ElasticAgent 是一个 Abstract Class，真正运行的代理都需要由此派生。从 ElasticAgent 的注释可知，代理进程负责管理一个或多个worker process。工作进程被**假定为常规分布式PyTorch脚本**。当worker进程由代理创建时，代理Agent将为worker进程提供必要的信息，以便正确初始化torch进程组。部署时，**精确的拓扑**和 agent-to-worker 比率取决于代理的具体实现和用户作业放置偏好。<br>
+
+```python
+class ElasticAgent(abc.ABC):
+    """
+    Agent process responsible for managing one or more worker processes.
+    The worker processes are assumed to be regular distributed PyTorch scripts.
+    When the worker process is created by the agent, the agent provides the
+    necessary information for the worker processes to properly initialize
+    a torch process group.
+
+    The exact deployment topology and ratio of agent-to-worker is dependent
+    on the specific implementation of the agent and the user's job placement
+    preferences. 
+
+    Usage
+    ::
+
+     group_result = agent.run()
+      if group_result.is_failed():
+        # workers failed
+        failure = group_result.failures[0]
+        log.exception(f"worker 0 failed with exit code : {failure.exit_code}")
+      else:
+        return group_result.return_values[0] # return rank 0's results
+
+    """
+
+    @abc.abstractmethod
+    def run(self, role: str = DEFAULT_ROLE) -> RunResult:
+        """
+        Runs the agent, retrying the worker group on failures up to
+        ``max_restarts``.
+
+        Returns:
+            The result of the execution, containing the return values or
+            failure details for each worker mapped by the worker's global rank.
+
+        Raises:
+            Exception - any other failures NOT related to worker process
+        """
+        raise NotImplementedError()
+
+    @abc.abstractmethod
+    def get_worker_group(self, role: str = DEFAULT_ROLE) -> WorkerGroup:
+        """
+        Returns:
+            The ``WorkerGroup`` for the given ``role``.
+            Note that the worker group is a mutable object and hence in a
+            multi-threaded/process environment it may change state.
+            Implementors are encouraged (but not required) to return
+            a defensive read-only copy.
+        """
+        raise NotImplementedError()
+```
+
+- SimpleElasticAgent 实现了基类的部分函数，其目的是为了方便扩展新代理的实现。
+- LocalElasticAgent 派生了SimpleElasticAgent ，是目前弹性训练最终使用的代理，主要用于在本地进行操作，负责管理单机上所有的worker进程。
+
+# 3 Worker
 
 
 
