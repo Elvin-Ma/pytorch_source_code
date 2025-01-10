@@ -273,6 +273,9 @@ def determine_local_world_size(nproc_per_node: str):
 
 ## 7.1 elastic_launch 入口
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;通过torchrun 可以调用elastic_launch, 也可以直接用torch.distributed.launcher.api.elastic_launch 来直接调用elastic_launch. <br>
+
+**torchrun 会调用到这里来实现elastic_launch : /root/mtn/pytorch/torch/distributed/run.py** <br>
+
 ```python
 import uuid
 import torch
