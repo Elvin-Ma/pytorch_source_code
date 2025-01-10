@@ -462,11 +462,240 @@ use_agent_store = spec.rdzv_handler.get_backend() == "static"
 ### 7.3.2 WorkerGroup
 WorkerGroup 代表了一个工作组。WorkerGroup 作为一个整体来管理多个 workers，进行批量处理。<br>
 
+```python
+class WorkerGroup:
+    """A set of ``Worker`` instances.
 
+    The class defines a set of ``Worker`` instances for the given ``WorkerSpec`` managed by ``ElasticAgent``. Whether the worker
+    group contains cross instance workers or not depends on the implementation of the agent.
+    """
 
+    __slots__ = [
+        "spec",
+        "workers",
+        "store",
+        "group_rank",
+        "group_world_size",
+        "state",
+        "master_addr",
+        "master_port",
+    ]
 
+    def __init__(self, spec: WorkerSpec):
+        self.spec = spec
+        self.workers = [Worker(local_rank=i) for i in range(self.spec.local_world_size)]
 
+        # assigned after rdzv
+        self.store = None
+        self.group_rank = None
+        self.group_world_size = None
+        self.master_addr = None
+        self.master_port = None
 
+        self.state = WorkerState.INIT
+```
 
+在SimpleElasticAgent 初始化之中，会建立一个 WorkerGroup。<br>
+
+```python
+class SimpleElasticAgent(ElasticAgent):
+    """
+    An ``ElasticAgent`` that manages workers (``WorkerGroup``)
+    for a single ``WorkerSpec`` (e.g. one particular type of worker role).
+    """
+
+    def __init__(self, spec: WorkerSpec, exit_barrier_timeout: float = 300):
+        self._worker_group = WorkerGroup(spec)
+        self._remaining_restarts = self._worker_group.spec.max_restarts
+        self._store = None
+        self._exit_barrier_timeout = exit_barrier_timeout
+        self._total_execution_time = 0
+```
+
+和 LocalElasticAgent 及 WorkerSpec的关系如下：<br>
+```python
++-----------------------------+      +------------------------------------------------+
+| LocalElasticAgent           |      | WorkerSpec                                     |
+|                             |      |                                                |
+| +------------------------+  |      |   rdzv_handler = {DynamicRendezvousHandler} -------+
+| |WorkerGroup             |  |      |                                                |   |
+| |            spec +--------------> |   entry = worker_fn                            |   |
+| |            workers     |  |      |                                                |   |
+| |            store       |  |      |   role = {str} 'trainer'                       |   |
+| |            group_rank  |  |      |                                                |   |
+| |       group_world_size |  |      +------------------------------------------------+   |
+| |                        |  |                                                           |
+| +------------------------+  |                                                           |
+|                             |                                                           |
+| rdzv_run_id                 |                                                           |
+| store                       |            +-----------------------------------------+    |
+|                             |            |DynamicRendezvousHandler                 |    |
++-----------------------------+            |                                         |    |
+                                           |                                         |    |
+                                           |   _settings: RendezvousSettings         | <--+
+                                           |                                         |
+                                           |   _store: Store                         |
+                                           |                                         |
+                                           |   _state_holder: _RendezvousStateHolder |
+                                           |                                         |
+                                           |   _op_executor: _RendezvousOpExecutor   |
+                                           |                                         |
+                                           +-----------------------------------------+
+```
+
+### 7.3.4 SimpleElasticAgent 是 LocalElasticAgent的基类
+
+所以会先运行到SimpleElastic的run方法里。<br>
+
+```
+    @prof
+    def run(self, role: str = DEFAULT_ROLE) -> RunResult:
+        start_time = time.monotonic()
+        shutdown_called: bool = False
+        try:
+            result = self._invoke_run(role)
+            self._total_execution_time = int(time.monotonic() - start_time)
+            self._record_metrics(result)
+            self._record_worker_events(result)
+            return result
+        except RendezvousGracefulExitError as e:
+            logger.info("Rendezvous gracefully exited: %s", e)
+        except SignalException as e:
+            logger.warning("Received %s death signal, shutting down workers", e.sigval)
+            self._shutdown(e.sigval)
+            shutdown_called = True
+            raise
+        finally:
+            if not shutdown_called:
+                self._shutdown()
+            # record the execution time in case there were any exceptions during run.
+            self._total_execution_time = int(time.monotonic() - start_time)
+```
+
+### 7.3.5 Agent 在 invoke_run 中做如下操作
+
+1. 启动 _initialize_workers，这里会使用 _rendezvous 构建一个 rendezvous，然后调用 _start_workers **启动 workers**。<br>
+2. 进入 while True 循环，在循环之中：<br>
+**通过 _monitor_workers 定期轮训用户程序运行情况，得到客户进程运行结果，然后依据情况作出判断。** <br>
+- 如果程序正常结束，则返回。<br>
+- 如果程序出错，则重试，即重启所有 workers，如果重试次数达到依然有问题，就结束所有workers。<br>
+- 如果节点成员关系有变化，比如scale up就会有新的节点在waiting，这时候就重启所有workers。<br>
+
+```python
+def _invoke_run(self, role: str = DEFAULT_ROLE) -> RunResult:
+        # NOTE: currently only works for a single role
+
+        spec = self._worker_group.spec
+        role = spec.role
+
+        logger.info(
+            "[%s] starting workers for entrypoint: %s", role, spec.get_entrypoint_name()
+        )
+
+        self._initialize_workers(self._worker_group)
+        monitor_interval = spec.monitor_interval
+        rdzv_handler = spec.rdzv_handler
+
+        while True:
+            assert self._worker_group.state != WorkerState.INIT
+            time.sleep(monitor_interval) # 定期监控
+            run_result = self._monitor_workers(self._worker_group) # 监控客户程序运行情况，得到进程运行结果
+            state = run_result.state
+            self._worker_group.state = state
+
+            put_metric(f"workers.{role}.remaining_restarts", self._remaining_restarts)
+            put_metric(f"workers.{role}.{state.name.lower()}", 1)
+
+            if state == WorkerState.SUCCEEDED:
+                logger.info(
+                    "[%s] worker group successfully finished."
+                    " Waiting %s seconds for other agents to finish.",
+                    role,
+                    self._exit_barrier_timeout,
+                )
+                self._exit_barrier() # 程序正常结束
+                return run_result
+            elif state in {WorkerState.UNHEALTHY, WorkerState.FAILED}: # 程序出错
+                if self._remaining_restarts > 0: # 重试
+                    logger.info(
+                        "[%s] Worker group %s. "
+                        "%s/%s attempts left;"
+                        " will restart worker group",
+                        role,
+                        state.name,
+                        self._remaining_restarts,
+                        spec.max_restarts,
+                    )
+                    self._remaining_restarts -= 1
+                    self._restart_workers(self._worker_group)
+                else:
+                    self._stop_workers(self._worker_group)         # 重试达到次数，结束workers
+                    self._worker_group.state = WorkerState.FAILED
+                    return run_result
+            elif state == WorkerState.HEALTHY:
+                # 节点成员关系有变化，比如scale up, 就会有新节点waiting
+                # membership changes do not count as retries
+                num_nodes_waiting = rdzv_handler.num_nodes_waiting()
+                group_rank = self._worker_group.group_rank
+                if num_nodes_waiting > 0: # 如果有新的节点在waiting, 就重启所有workers
+                    logger.info(
+                        "[%s] Detected %s "
+                        "new nodes from group_rank=%s; "
+                        "will restart worker group",
+                        role,
+                        num_nodes_waiting,
+                        group_rank,
+                    )
+                    self._restart_workers(self._worker_group)
+            else:
+                raise Exception(  # noqa: TRY002
+                    f"[{role}] Worker group in {state.name} state"
+                )
+```
+
+于是最终逻辑如下：<br>
+
+```python
++----------------------------------------------+
+| LocalElasticAgent                            |
+|                                              |    +---------------------------------------------------+
+|  rdzv_run_id                                 |    | WorkerSpec                                        |
+|                                              |    |                                                   |
+|  store           +------------------------+  |    |      rdzv_handler = {DynamicRendezvousHandler} +-------+
+|                  |WorkerGroup             |  |    |                                                   |    |
+|  _pcontext       |            spec +------------> |      entry = worker_fn                            |    |
+|                  |            workers     |  |    |                                                   |    |
+|                  |            store       |  |    |      role = {str} 'trainer'                       |    |
+|                  |            group_rank  |  |    |                                                   |    |
+|                  |       group_world_size |  |    +---------------------------------------------------+    |
+|                  |                        |  |                                                             |
+|                  +------------------------+  |                                                             |
+|  +----------------------------------------+  |                                                             |
+|  | _invoke_run                            |  |                                                             |
+|  |                                        |  |             +-----------------------------------------+     |
+|  |   _initialize_workers +------------------------+        |DynamicRendezvousHandler                 |     |
+|  |                                        |  |    |        |                                         |     |
+|  |                                        |  |    |        |                                         |     |
+|  |   while True:                          |  |    |        |   _settings: RendezvousSettings         | <---+
+|  |       _monitor_workers(_worker_group)  |  |    |        |                                         |
+|  |                +                       |  |    |        |   _store: Store                         |
+|  |                | _pcontext.wait        |  |    |        |                                         |
+|  |                |                       |  |    |        |   _state_holder: _RendezvousStateHolder |
+|  +----------------------------------------+  |    |        |                                         |
+|                   |                          |    |        |   _op_executor: _RendezvousOpExecutor   |
++----------------------------------------------+    |        |                                         |
+                    |                               |        +-----------------------------------------+
+                    |                               |
+                    v                               v
+         +-------------------------------------------------+
+         |  +------------+  +------------+  +------------+ |
+         |  |Process     |  |Process     |  |Process     | |
+         |  |            |  |            |  |            | |
+         |  |    work_fn |  |   work_fn  |  |    work_fn | |
+         |  |            |  |            |  |            | |
+         |  +------------+  +------------+  +------------+ |
+         +-------------------------------------------------+
+
+```
 
 
