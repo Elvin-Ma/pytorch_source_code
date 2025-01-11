@@ -18,7 +18,7 @@
 ## 1.3 Exclusivity(独占性)
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;一个简单的分布式barrier并不足够(sufficient)，因为我们还需要确保**在任何给定时间（针对给定任务）只存在一个节点组**。换句话说，新的节点（即晚加入的节点）不能够形成同一个任务的并行独立工作节点组。<br>
 
-&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Torch Distributed Elastic rendezvous确保 : 如果一个节点组已经完成集合rendezvous（并且因此可能已经开始训练），那么尝试rendezous的其他“迟到”节点将只能宣布自己处于等待状态，并且必须等到（之前已完成的）现有rendezvous被销毁后才能继续。<br>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Torch Distributed Elastic rendezvous确保 : 如果一个节点组已经完成集合rendezvous（并且因此可能已经开始训练），那么尝试rendezous的其他“迟到”节点将只能宣布自己处于等待状态，并且必须等到（之前已完成的）**现有rendezvous被销毁后才能继续**。<br>
 
 ## 1.4 Consistency(一致性)
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;当rendezvous完成时，其所有成员将就任务成员身份(job membership)以及各自在任务中的角色达成一致。这个角色通过一个称为“秩”（rank）的整数来表示，其值在0和世界大小（world size）之间。<br>
