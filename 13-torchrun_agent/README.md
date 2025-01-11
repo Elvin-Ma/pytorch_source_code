@@ -160,7 +160,7 @@ class ElasticAgent(abc.ABC):
 - LocalElasticAgent 派生了SimpleElasticAgent ，是目前弹性训练最终使用的代理，主要用于在本地进行操作，负责管理单机上所有的worker进程。
 
 # 3 Worker
-Worker 类代表了一个worker实例，我们上文介绍了WorkerSpec，Worker 就是依据 WorkerSpec 构建出来的，其重点成员变量如下：<br>
+## 3.1. Worker 类代表了一个worker实例，我们上文介绍了WorkerSpec，Worker 就是依据 WorkerSpec 构建出来的，其重点成员变量如下：<br>
 
 - id（任意）：唯一标识一个worker，具体是由ElasticAgent的特定实现来解释，对于本地代理，它可以是worker的pid（int），对于远程代理，它可以被编码为``host:port（string）`。<br>
 - local_rank ：worker的local rank。<br>
@@ -169,6 +169,133 @@ Worker 类代表了一个worker实例，我们上文介绍了WorkerSpec，Worker
 - world_size：全局worker数量。<br>
 - role_world_size：具有相同角色的worker数量。<br>
 
+## 3.2. WorkerGroup 代表了一个工作组，作为一个整体来管理多个 workers，进行批量处理. <br>
+
+## 3.3. 在SimpleElasticAgent 初始化之中，会建立一个 WorkerGroup. <br>
+```python
+class SimpleElasticAgent(ElasticAgent):
+    """
+    An ``ElasticAgent`` that manages workers (``WorkerGroup``)
+    for a single ``WorkerSpec`` (e.g. one particular type of worker role).
+    """
+
+    def __init__(self, spec: WorkerSpec, exit_barrier_timeout: float = 300):
+        self._worker_group = WorkerGroup(spec)
+        self._remaining_restarts = self._worker_group.spec.max_restarts
+        self._store = None
+        self._exit_barrier_timeout = exit_barrier_timeout
+        self._total_execution_time = 0
+```
+
+## 3.4. WorkerState 表示 WorkerGroup的状态。工作组中的所有工作人员作为一个整体来维护/更改状态。如果工作组中的一个worker失败，则整个工作组被认为是失败：<br>
+
+- UNKNOWN-代理**丢失了**对工作组状态的跟踪，无法恢复
+
+- INIT-创建的工作组对象**尚未启动**
+
+- HEALTHY-worker健康运行
+
+- UNHEALTHY-worker在运行但是不健康
+
+- STOPPED-代理停止（中断）worker
+
+- SUCCEEDED-worker已完成运行(exit数值为0)
+
+- FAILED-worker未能成功完成（exit数值不等于0)
+
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;WorkerGroup从初始的INIT状态开始，然后进入"HEALTHY"或"UNHEALTHY"状态，最后到达终端"SUCCEEDED"或"FAILED"状态。工作组可以被代理打断并且临时置于"STOPPED"状态。处于"已停止"状态的工作进程可以在不久的将来被**调度重启**，被设置为已停止的状态的例子为：<br>
+- 观察到工作组故障|不健康 <br>
+- 检测到成员更改 <br>
+
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;当**工作组上的操作（启动、停止、rdzv、重试等）失败**，并导致操作部分应用于工作组时，状态将为"**未知**"。这通常发生在**状态改变期间发生异常**，而且异常未捕获/未处理的情况下。当工作组处于"未知"状态，Agent**不会恢复工作组**，因此**最好终止作业**，并且**由job manager重试节点**。<br>
+
+# 4 SimpleElasticAgent
+## 4.1 总体运行
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;SimpleElasticAgent 是 Agent 的实现类之一。此抽象是为了方便扩展新的 agent 实现。从后面可知，目前内置的 **LocalElasticAgent 负责管理单机上的所有 worker 进程**，如果用户希望只用**一个代理**就管理多机上所有的 worker，而不仅仅是本机 worker，那么可以通过扩展 SimpleElasticAgent 来实现一个自定义 Agent。<br>
+
+SimpleElasticAgent 主循环 _invoke_run 是核心逻辑（这里默认代理和worker在同一个机器之上），其中做如下操作：<br>
+
+1. 使用 self._initialize_workers(self._worker_group) 完成初始化工作，比如来启动 worker，为每个worker 分配 rank 等等。<br>
+2. 然后进入 while True 循环，在循环之中通过 _monitor_workers 定期轮训用户程序运行情况，得到 worker 进程运行结果，然后依据情况进行不同处理。<br>
+- 如果程序正常结束，则返回。<br>
+- 如果程序出错，则重试，如果重试次数达到，结束workers。<br>
+- 如果节点成员关系有变化，比如scale up就会有新的节点在waiting，这时候就重启所有workers。<br>
+
+```python
+def _invoke_run(self, role: str = DEFAULT_ROLE) -> RunResult:
+    # NOTE: currently only works for a single role
+
+    spec = self._worker_group.spec
+    role = spec.role
+
+    logger.info(
+        "[%s] starting workers for entrypoint: %s", role, spec.get_entrypoint_name()
+    )
+
+    self._initialize_workers(self._worker_group)
+    monitor_interval = spec.monitor_interval
+    rdzv_handler = spec.rdzv_handler
+
+    while True:
+        assert self._worker_group.state != WorkerState.INIT
+        time.sleep(monitor_interval)
+        run_result = self._monitor_workers(self._worker_group)
+        state = run_result.state
+        self._worker_group.state = state
+
+        put_metric(f"workers.{role}.remaining_restarts", self._remaining_restarts)
+        put_metric(f"workers.{role}.{state.name.lower()}", 1)
+
+        if state == WorkerState.SUCCEEDED:
+            logger.info(
+                "[%s] worker group successfully finished."
+                " Waiting %s seconds for other agents to finish.",
+                role,
+                self._exit_barrier_timeout,
+            )
+            self._exit_barrier()
+            return run_result
+        elif state in {WorkerState.UNHEALTHY, WorkerState.FAILED}:
+            if self._remaining_restarts > 0:
+                logger.info(
+                    "[%s] Worker group %s. "
+                    "%s/%s attempts left;"
+                    " will restart worker group",
+                    role,
+                    state.name,
+                    self._remaining_restarts,
+                    spec.max_restarts,
+                )
+                self._remaining_restarts -= 1
+                self._restart_workers(self._worker_group)
+            else:
+                self._stop_workers(self._worker_group)
+                self._worker_group.state = WorkerState.FAILED
+                return run_result
+        elif state == WorkerState.HEALTHY:
+            # membership changes do not count as retries
+            num_nodes_waiting = rdzv_handler.num_nodes_waiting()
+            group_rank = self._worker_group.group_rank
+            if num_nodes_waiting > 0:
+                logger.info(
+                    "[%s] Detected %s "
+                    "new nodes from group_rank=%s; "
+                    "will restart worker group",
+                    role,
+                    num_nodes_waiting,
+                    group_rank,
+                )
+                self._restart_workers(self._worker_group)
+        else:
+            raise Exception(  # noqa: TRY002
+                f"[{role}] Worker group in {state.name} state"
+            )
+```
+
+## 4.2 初始化workers
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;代理主循环之中，首先使用 self._initialize_workers(self._worker_group) 来启动 worker。在 _initialize_workers之中：<br>
+- 首先使用 self._rendezvous(worker_group) 进行节点之间的**同步共识操作以及rank处理**等等。<br>
+- 其次调用 **_start_workers 启动 workers**。这里的 **_start_workers** 是虚函数，**需要派生类实现**。<br>
 
 
 
