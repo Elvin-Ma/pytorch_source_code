@@ -90,7 +90,7 @@ Torchelastic agent 和 用户 worker 依据故障切换契约来工作：<br>
 *注释：etcd是一个高可用的分布式键值存储系统，主要用于存储配置信息、服务发现、协调以及其他需要高度可用性的场景。* <br>
 
 ## 2.3 Agent UML 图
-![agent uml](images/agent.png)
+![agent uml](images/torchrun-agent.png)
 
 ## 2.4 agent 有多种配置方式
 
