@@ -89,6 +89,9 @@ Torchelastic agent 和 用户 worker 依据故障切换契约来工作：<br>
 
 *注释：etcd是一个高可用的分布式键值存储系统，主要用于存储配置信息、服务发现、协调以及其他需要高度可用性的场景。* <br>
 
+## 2.3 Agent UML 图
+![agent uml](images/agent.png)
+
 ## 2.4 agent 有多种配置方式
 
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;单的agent部署在每个节点上，并与本地进程协同工作。更高级的agent可以远程启动和管理workers。Agent可以做到彻底的去中心化，与其他agents（管理同一个job的workers）进行沟通协调做出一个集体性决策，决策是基于其管理的 workers 情况来完成。对于如何配置，源码中也给出了示例，如果在GPU上启动训练一个拥有 8 个 trainer（每GPU一个trainer）的 job，我们可以做如下可能的配置: <br>
@@ -615,4 +618,390 @@ def _start_workers(self, worker_group: WorkerGroup) -> Dict[int, Any]:
 +--------------------------------------------------+
 ```
 
+## 4.7 _assign_worker_ranks 内部细节
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Agent使用_RoleInstanceInfo与其他agent交换信息。该信息用于确定本agent workers的rank。<br>
+
+```python
+class _RoleInstanceInfo:
+    """The class is used by the agent to exchange the information with other agents.
+
+    The information is used to determine the rank of the workers that agent
+    manages in heterogeneous environments, where different agents can have
+    different number of workers.
+    """
+
+    __slots__ = ["role", "rank", "local_world_size"]
+
+    def __init__(self, role: str, rank: int, local_world_size: int):
+        r"""Initialize the agent class instance.
+
+        Args:
+            role (str): user-defined role for the workers with this spec
+            rank (int): the rank of the agent
+            local_world_size (int): number of local workers to run
+        """
+        self.role = role
+        self.rank = rank
+        self.local_world_size = local_world_size
+```
+
+接下来，在各个代理之间同步，得到角色的总体信息。每个代理将其配置（group_rank, group_world_size , num_workers）写入公共存储。这里就是使用之前 Rendezvous 返回的 store 来进行信息共享。<br>
+
+```python
+agent_role_info = _RoleInstanceInfo(
+    spec.role, group_rank, spec.local_world_size
+)
+
+# 每个agent 都将 agent_role_info 写到公共存储store
+store.set(f"{ROLE_INFO_PREFIX}{group_rank}", agent_role_info.serialize())
+
+# tcp store is collocated with rank 0 so we can use it to do extra compute to reduce overall # of operations.
+# tcp存储与秩0共置(最接近)，因此我们可以利用它进行额外计算以减少总操作数。
+if group_rank == 0:
+    role_infos_bytes = store.multi_get(
+        [f"torchelastic/role_info/{i}" for i in range(group_world_size)]
+    )
+    role_infos = [
+        _RoleInstanceInfo.deserialize(info_bytes)
+        for info_bytes in role_infos_bytes
+    ]
+
+    role_sizes = defaultdict(lambda: 0)
+    global_size = 0
+    for role_info in role_infos:
+        role_sizes[role_info.role] += role_info.local_world_size
+        global_size += role_info.local_world_size
+
+    base_global_rank = 0
+    role_ranks = defaultdict(lambda: 0)
+
+    keys = []
+    values = []
+    for i, role_info in enumerate(role_infos):
+        keys.append(f"{ASSIGNED_RANKS_PREFIX}{i}")
+        values.append(
+            json.dumps(
+                [
+                    base_global_rank,
+                    global_size,
+                    role_ranks[role_info.role],
+                    role_sizes[role_info.role],
+                ]
+            )
+        )
+
+        base_global_rank += role_info.local_world_size
+        role_ranks[role_info.role] += role_info.local_world_size
+
+    store.multi_set(keys, values)
+```
+
+**至此总的逻辑为：** <br>
+1. 调用 rdzv_handler.next_rendezvous() 来和其它节点进行同步，获得信息。<br>
+2. 获得信息中的store（可以认为就是远端的KV存储），group_world_size，group_rank 传给 Agent。<br>
+3. ranks 等信息传给 _assign_worker_ranks方法。<br>
+4. _assign_worker_ranks 之中，调用 store.set、store.multi_get、store.multi_set在各个代理之间同步，得到角色的总体信息。每个代理将其配置（group_rank, group_world_size , num_workers）写入公共KV存储。<br>
+5. 依据 role infos 来确定全局rank：当前代理的global rank是 本代理 的 group_rank 在infos数组的偏移量（offset）。偏移量的计算方法是，排名低于group_rank的所有代理的local_world之和。<br>
+6. 使用各种信息建立一系列的 Workers。<br>
+7. Workers 被复制给 Agent 的 WorkerGroup 之中。<br>
+
+```python
+                                                              _initialize_workers
+                                                                      +
+                                                                      |
+                                                                      |
+                                                                      v
+                                                              _rendezvous(worker_group)
+                                                                      +
++----------------------------------------------+                      |
+| LocalElasticAgent                            |                      | 1
+|                                              |   2                  v
+|                                         +--------------+  rdzv_handler.next_rendezvous()
+| +--------------------+                  |    |                      +
+| | WorkerGroup        |                  |    |                      |
+| |                    |                  |    |                    3 | ranks
+| |                    |                  |    |                      v
+| |  spec              |                  |    |       +--------------+------------------+
+| |                    |                  |    |       | _assign_worker_ranks            |
+| |                    |                  |    |       |                                 |
+| |  store   <----------------------------+    |       |                        4        |
+| |                    |                  |    |       | role_infos = store.set          |
+| |                    |                  |    |       |               +                 |
+| |  group_world_size<--------------------+    |       |               | 5               |
+| |                    |                  |    |       |               |                 |
+| |                    |                  |    |       |               v                 |
+| |  group_rank <-------------------------+    |       |           store.multi_get       |
+| |                    |                       |       |    store.multi_set(keys, values)|
+| |                    |   +----------------+  |       |               +                 |
+| |  workers  +----------->+ Worker0(rank 0)|  |       |               |                 |
+| |                    |   | Worker1(rank 1)|  |       |               | 6               |
+| |                    |   | ...            |  |Workers|               v                 |
+| |                    |   | Workern(rank n)+<------------+ new Worker(local_rank,       |
+| +--------------------+   +----------------+  |    7  |               global_rank,      |
+|                                              |       |               role_rank,        |
++----------------------------------------------+       |               world_size,       |
+                                                       |               role_world_size)  |
+                                                       |                                 |
+                                                       +---------------------------------+
+```
+
+## 4.8 barrier
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;实际上，几乎不可能保证DDP的所有 worker 都能保证同时结束，所以因此TE提供了一个finalization barrier，这个barrier的作用是对worker finalization 实施等待超时（5分钟）。<br>
+
+```python
+def _exit_barrier(self):
+    """
+    Wait for ``exit_barrier_timeout`` seconds for all agents to finish
+    executing their local workers (either successfully or not). This
+    acts as a safety guard against user scripts that terminate at different
+    times. This barrier keeps the agent process alive until all workers finish.
+    """
+    start = time.time()
+    try:
+        store_util.barrier(
+            self._store,
+            self._worker_group.group_rank,
+            self._worker_group.group_world_size,
+            key_prefix=_TERMINAL_STATE_SYNC_ID,
+            barrier_timeout=self._exit_barrier_timeout,
+        )
+    except Exception:
+        log.exception(
+            f"Error waiting on exit barrier. Elapsed: {time.time() - start} seconds"
+        )
+```
+
+# 5 LocalElasticAgent
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;LocalElasticAgent 是弹性训练最终使用的代理，主要用于在本地进行操作，负责管理单机上所有的worker进程，其派生自 SimpleElasticAgent。<br>
+
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;此agent在**每个主机之上部署**，并配置为生成n个工作进程。当使用GPU时，**n是主机上可用的GPU数量**。本地agent**不会**与部署在其他主机上的其他本地agent通信，即使worker可以在主机间通信。Worker id被解释为本地进程。**agent作为把本机所有worker process作为一个整体启动和停止**。<br>
+
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;传递给worker的函数和参数必须与python multiprocessing兼容。要将multiprocessing数据结构传递给worker，用户可以在与指定的start_method相同的多处理multiprocessing中创建数据结构，并将其作为函数参数传递。<br>
+
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;exit_barrier_timeout用来**指定等待其他agent完成的时间量(以秒为单位)**。这起到了一个安全网的作用，可以处理worker在不同时间完成的情况，以防止agent将提前完成的worker视为scale-down事件。**强烈建议用户代码确保worker以同步方式终止，而不是依赖于exit_barrier_timeout**。<br>
+
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;SimpleElasticAgent 主要是提供给了初始化和总体运行方式，但是遗留了一些抽象函数没有被实现，比如_start_workers，_stop_workers，_monitor_workers，_shutdown。LocalElasticAgent 就补齐了这些函数。<br>
+
+# 6 整体运行流程
+
+```python
+def trainer(args) -> str:
+    return "do train"
+
+def main():
+    start_method="spawn"
+    shared_queue= multiprocessing.get_context(start_method).Queue()
+    spec = WorkerSpec(
+                role="trainer",
+                local_world_size=nproc_per_process,
+                entrypoint=trainer,
+                args=("foobar",),
+                ...<OTHER_PARAMS...>)
+    agent = LocalElasticAgent(spec, start_method)
+    results = agent.run()
+
+    if results.is_failed():
+        print("trainer failed")
+    else:
+        print(f"rank 0 return value: {results.return_values[0]}")
+        # prints -> rank 0 return value: do train
+```
+
+# 7 _initialize_workers 里 _start_workers 
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;_start_workers 方法会调用 start_processes 来启动 worker 进程，默认_start_method 是 "spawn"。也就是启动了多个进程，并行执行用户程序。同时这些进程的运行结果会被监控。start_processes 参数之中，entrypoint和args 是用户命令和参数，entrypoint可以是函数或者字符串。<br>
+
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;_start_workers 把 start_processes 方法启动多进程的结果保存在 **_pcontext ：PContext** 之中，**后续就用 _pcontext 来继续控制**，比如结束 worker 就是直接调用 _pcontext 的 close方法。<br>
+
+```python
+def _start_workers(self, worker_group: WorkerGroup) -> Dict[int, Any]:
+    spec = worker_group.spec
+    store = worker_group.store
+    assert store is not None
+    restart_count = spec.max_restarts - self._remaining_restarts
+
+    use_agent_store: bool = spec.rdzv_handler.use_agent_store
+    logger.info("use_agent_store: %s", use_agent_store)
+
+    args: Dict[int, Tuple] = {}
+    envs: Dict[int, Dict[str, str]] = {}
+    log_line_prefixes: Optional[Dict[int, str]] = (
+        {} if self._log_line_prefix_template else None
+    )
+    for worker in worker_group.workers:
+        local_rank = worker.local_rank
+        worker_env = {
+            "LOCAL_RANK": str(local_rank),
+            "RANK": str(worker.global_rank),
+            "GROUP_RANK": str(worker_group.group_rank),
+            "ROLE_RANK": str(worker.role_rank),
+            "ROLE_NAME": spec.role,
+            "LOCAL_WORLD_SIZE": str(spec.local_world_size),
+            "WORLD_SIZE": str(worker.world_size),
+            "GROUP_WORLD_SIZE": str(worker_group.group_world_size),
+            "ROLE_WORLD_SIZE": str(worker.role_world_size),
+            "MASTER_ADDR": worker_group.master_addr,
+            "MASTER_PORT": str(worker_group.master_port),
+            "TORCHELASTIC_RESTART_COUNT": str(restart_count),
+            "TORCHELASTIC_MAX_RESTARTS": str(spec.max_restarts),
+            "TORCHELASTIC_RUN_ID": spec.rdzv_handler.get_run_id(),
+            "TORCHELASTIC_USE_AGENT_STORE": str(use_agent_store),
+            "TORCH_NCCL_ASYNC_ERROR_HANDLING": os.getenv(
+                "TORCH_NCCL_ASYNC_ERROR_HANDLING", str(1)
+            ),
+        }
+        if "OMP_NUM_THREADS" in os.environ:
+            worker_env["OMP_NUM_THREADS"] = os.environ["OMP_NUM_THREADS"]
+
+        if self._log_line_prefix_template:
+            log_line_prefix = Template(
+                self._log_line_prefix_template
+            ).safe_substitute(
+                role_name=spec.role,
+                rank=worker.global_rank,
+                local_rank=local_rank,
+            )
+            log_line_prefixes[local_rank] = log_line_prefix
+
+        envs[local_rank] = worker_env
+        worker_args = list(spec.args)
+        worker_args = macros.substitute(worker_args, str(local_rank))
+        args[local_rank] = tuple(worker_args)
+
+    self._setup_local_watchdog(envs=envs)
+    self._setup_healthcheck()
+
+    assert spec.entrypoint is not None
+    assert self._logs_specs is not None
+    self._pcontext = start_processes(
+        name=spec.role,
+        entrypoint=spec.entrypoint,
+        args=args,
+        envs=envs,
+        logs_specs=self._logs_specs,
+        log_line_prefixes=log_line_prefixes,
+        start_method=self._start_method,
+    )
+
+    return self._pcontext.pids()
+```
+
+# 8 monitor ： 监控
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;运行之后，TE 会调用 _monitor_workers 对workers进行监控。之前把启动多线程的结果保存在 _pcontext 之中，现在就**用 _pcontext 对运行情况进行监控**。<br>
+
+```python
+@prof
+def _monitor_workers(self, worker_group: WorkerGroup) -> RunResult:
+    role = worker_group.spec.role
+    worker_pids = {w.id for w in worker_group.workers}
+    assert self._pcontext is not None
+    pc_pids = set(self._pcontext.pids().values())
+    if worker_pids != pc_pids:
+        logger.error(
+            "[%s] worker pids do not match process_context pids."
+            " Expected: %s, actual: %s",
+            role,
+            worker_pids,
+            pc_pids,
+        )
+        return RunResult(state=WorkerState.UNKNOWN)
+
+    result = self._pcontext.wait(0)
+    if result:
+        if result.is_failed():
+            # map local rank failure to global rank
+            worker_failures = {}
+            for local_rank, failure in result.failures.items():
+                worker = worker_group.workers[local_rank]
+                worker_failures[worker.global_rank] = failure
+            return RunResult(
+                state=WorkerState.FAILED,
+                failures=worker_failures,
+            )
+        else:
+            # copy ret_val_queue into a map with a global ranks
+            workers_ret_vals = {}
+            for local_rank, ret_val in result.return_values.items():
+                worker = worker_group.workers[local_rank]
+                workers_ret_vals[worker.global_rank] = ret_val
+            return RunResult(
+                state=WorkerState.SUCCEEDED,
+                return_values=workers_ret_vals,
+            )
+    else:
+        return RunResult(state=WorkerState.HEALTHY)
+```
+
+# 9 目前，整体逻辑梳理
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;因为启动和监控涉及到系统整体运行逻辑，需要和 rendezvous 一起才能更好理解，所以我们把这部分的分析推迟，等到 Rendezvous 之后再来做整体分析。<br>
+
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;目前总体逻辑如下：<br>
+- 调用 rdzv_handler.next_rendezvous() 来和其他节点进行同步，获得信息。<br>
+- 获得信息中的store（可以认为就是远端的KV存储），group_world_size，group_rank 传给 Agent。<br>
+- ranks 等信息传给 _assign_worker_ranks方法。<br>
+- _assign_worker_ranks 之中，调用 _share_and_gather 在各个代理之间同步，得到角色的总体信息。每个代理将其配置（group_rank, group_world_size , num_workers）写入公共KV存储。<br>
+- 依据 role infos 来确定全局rank：当前代理的global rank是 本代理 的 group_rank 在infos数组的偏移量（offset）。偏移量的计算方法是，排名低于- -- group_rank的所有代理的local_world之和。<br>
+- 使用各种信息建立一系列的 Workers。<br>
+- Workers 被复制给 Agent 的 WorkerGroup 之中。<br>
+- 使用 _start_workers 来启动 worker 进程。<br>
+- 把 worker 进程 id 赋值给 Agent 的 worker.id 之中，这样以后就可以用 worker.id 来操作进程。<br>
+- 使用 _monitor_workers 监控 worker 进程。<br>
+- 使用 _exit_barrier 来等待 worker 进程结束。<br>
+
+```python
+                                                              _initialize_workers
+                                                                      +
+                                                                      |
+                                                                      |
+                                                                      v
+                                                              _rendezvous(worker_group)
+                                                                      +
++----------------------------------------------+                      |
+| LocalElasticAgent                            |                      | 1
+|                                              |   2                  v
+|                                         +--------------+  rdzv_handler.next_rendezvous()
+| +--------------------+                  |    |                      +
+| | WorkerGroup        |                  |    |                      |
+| |                    |                  |    |                    3 | ranks
+| |                    |                  |    |                      v
+| |  spec              |                  |    |       +--------------+------------------+
+| |                    |                  |    |       | _assign_worker_ranks            |
+| |                    |                  |    |       |                                 |
+| |  store   <----------------------------+    |       |                        4        |
+| |                    |                  |    |       | role_infos = store.set          |
+| |                    |                  |    |       |               +          store) |
+| |  group_world_size<--------------------+    |       |               | 5               |
+| |                    |                  |    |       |               |                 |
+| |                    |                  |    |       |               v                 |
+| |  group_rank <-------------------------+    |       |          store.multi_set        |
+| |                    |                       |       |          store.multi_get        |
+| |                    |   +----------------+  |       |               +                 |
+| |  workers  +----------->+ Worker0(rank 0)|  |       |               |                 |
+| |                    |   | Worker1(rank 1)|  |       |               | 6               |
+| |                    |   | ...            |  |Workers|               v                 |
+| |                    |   | Workern(rank n)+<------------+ new Worker(local_rank,       |
+| +--------------------+   +---------+------+  |    7  |               global_rank,      |
+|                                    ^         |       |               role_rank,        |
+|                                    |         |       |               world_size,       |
+|                                    |         |       |               role_world_size)  |
++----------------------------------------------+       |                                 |
+                                     |                 +---------------+-----------------+
+                                     |                                 |
+                                     |                                 | 8
+                                     |              9                  v
+                                     +-----------------------+   _start_workers
+                                                                       +
+                                                                       | 10
+                                                                       |
+                                                                       v
+                                                       +---------------+--------------+
+                                                       | state = _monitor_workers     |
+                                                  +--> |                              +-->
+                                                  |    +---------------+--------------+  |
+                                                  |                    |                 |
+                                                  <--------------------------------------+
+                                                     LOOP  Every 30S   |
+                                                                       | 11
+                                                                       v
+                                                                    _exit_barrier
+```
 
