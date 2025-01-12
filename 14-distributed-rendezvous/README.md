@@ -87,8 +87,7 @@
 # 2 静态结构
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; elastic 内部另有一套 Rendezvous，和 distributed 原有的 Rendezvous 那套不一样，别搞混了。**distributed 原有的 Rendezvous 就是一套简单的 KV 存储**。elastic Rendezvous 则要复杂得多。这里主要描述elastic 的 Rendezvous<br>
 
-## 2.1 相关数据结构
-1. RendezvousParameters <br>
+## 2.1 RendezvousParameters <br>
 RendezvousParameters 是构建RendezvousHandler所需参数。<br>
 - backend ：后端名称。<br>
 - endpoint ：端点，格式是 <hostname>[:<port>]。<br>
@@ -97,7 +96,7 @@ RendezvousParameters 是构建RendezvousHandler所需参数。<br>
 - max_nodes ：rendezvous 的**最大节点数目**。<br>
 - kwargs ：后端的附加参数。<br>
 
-2. RendezvousSettings
+## 2.2 RendezvousSettings
 RendezvousSettings 类用来存储rendezvous的配置。可以理解为静态元信息。<br>
 - run_id : rendezvous 的 id. <br>
 - min_nodes ：rendezvous 的最小节点数目. <br>
@@ -106,7 +105,7 @@ RendezvousSettings 类用来存储rendezvous的配置。可以理解为静态元
 - keep_alive_interval ：节点在发送心跳之间等待的时间量. <br>
 - keep_alive_max_attempt ： 心跳的最大重试次数. <br>
 
-3. _RendezvousState
+## 2.3 _RendezvousState
 _RendezvousState 是rendezvous的状态。是动态信息，每一个 node 都会维护一个本地 state。<br>
 
 - round：Rendezvous的当前轮次. <br>
@@ -117,7 +116,7 @@ _RendezvousState 是rendezvous的状态。是动态信息，每一个 node 都�
 - wait_list：set结构，存放**等待参与下一轮rendezvous**操作的一组节点. <br>
 - last_heartbeats：字典，包含每个节点上次心跳时间. <br>
 
-4. _NodeDesc 节点
+## 2.4 _NodeDesc 节点
 _NodeDesc 是rendezvous的一个节点。<br>
 - fqdn：节点的完全限定域名（FQDN）。<br>
 - pid：运行集合点处理程序（rendezvous handler）的**进程ID**。<br>
@@ -144,5 +143,186 @@ class _NodeDesc:
     def __repr__(self) -> str:
         return f"{self.addr}_{self.pid}_{self.local_id}"
 ```
+
+## 2.5 backend
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;在 PyTorch 之中，backend 概念指的是当前进程要使用的通信后端，一般来说，支持的通信后端有 gloo，mpi，nccl 。建议用 nccl。<br>
+
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;在弹性训练这里, **DynamicRendezvousHandler**需要我们在构建时候指定后端(RendezvousBackend)。用户可以自己实现后端，或者使用如下PyTorch附带实现之一: <br>
+
+- **C10dRendezvousBackend**，其使用 C10d 存储(默认是**TCPStore**) 作为 rendezvous backend，其优势是不需要依赖第三方，比如etcd，来构建一个rendezvous 。<br>
+- **EtcdRendezvousBackend**，其使用EtcdRendezvousHandler，EtcdRendezvousBackend 等类来基于 etcd 完成。<br>
+
+EtcdRendezvousBackend 必须依赖 ETCD，需要安装一个 ETCD集群，所以推荐使用 c10d 后端，其易用性更好。我们接下来就主要介绍 c10d 后端。<br>
+
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;C10d 后端主要基于一个 **TCPStore**，通过 TCP 进行同步。我们在之前文章中介绍过 TCPStore，**TCPStore 是基于 TCP 的分布式键值存储(KVStore)实现**（类似于 Redis）。是一个典型的**client-server架构**，服务器存储/保存数据，而存储客户端可以通过 TCP 连接到服务器存储并执行诸如set()插入键值对、get()检索键值对等操作。<br>
+
+**example** <br>
+```python
+store = TCPStore("localhost")
+
+backend = C10dRendezvousBackend(store, "my_run_id")
+
+rdzv_handler = DynamicRendezvousHandler.from_backend(
+    run_id="my_run_id",
+    store=store,
+    backend=backend,
+    min_nodes=2,
+    max_nodes=4
+)
+```
+
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;所以，对于 c10d 后端来说，在其中一个agent之上会运行**TCPStore Master**，其负责**监听端口**，提供API，Rendezvous 的各种**同步操作**，都是由各个agent连接到这个**中心化**的 TCPStore Master，在其上完成。<br>
+
+**TCPStore 的创建** <br>
+```python
+def _create_tcp_store(params: RendezvousParameters) -> TCPStore:
+    host, port = parse_rendezvous_endpoint(params.endpoint, default_port=29400)
+
+    cfg_is_host = params.get_as_bool("is_host")
+    # If the user has explicitly specified whether our process should host the
+    # the store, respect it.
+    if cfg_is_host is not None: # 如果配置了，就使用
+        is_host = cfg_is_host
+    # Otherwise try to determine whether we are the host based on our hostname
+    # and IP address.
+    else: # 动态看看本机是不是host
+        is_host = _matches_machine_hostname(host)
+
+    # The timeout
+    read_timeout = cast(int, params.get_as_int("read_timeout", 60))
+    if read_timeout <= 0:
+        raise ValueError("The read timeout must be a positive integer.")
+
+    # In specific cases we attempt to instantiate the store twice. For details
+    # see the explanation in the except clause below.
+    for is_server in [is_host, False]:
+        try:
+            store = TCPStore(
+                host,
+                port,
+                is_master=is_server,
+                multi_tenant=True,
+                timeout=timedelta(seconds=read_timeout),
+                use_libuv=params.use_libuv,
+            )
+
+            if is_server:
+                msg = f"Process {os.getpid()} hosts the TCP store for the C10d rendezvous backend."
+                construct_and_record_rdzv_event(
+                    run_id=params.run_id, message=msg, node_state=NodeState.INIT
+                )
+                logger.info(msg)
+
+            break
+        except (ValueError, RuntimeError, TimeoutError) as exc:
+            # If we heuristically inferred the value of is_host as True and our
+            # first attempt to instantiate the TCP store has failed, try it one
+            # more time with is_host set to False. As an edge case there can be
+            # more than one process that is part of the same rendezvous on this
+            # machine and only one of them will eventually host the store.
+
+            if not is_server or cfg_is_host is not None:
+                raise RendezvousConnectionError(
+                    "The connection to the C10d store has failed. See inner exception for details."
+                ) from exc
+
+    return store  # type: ignore[possibly-undefined]
+```
+
+**C10dRendezvousBackend** <br>
+C10dRendezvousBackend 其核心就是一个 Store，用来存储相关信息，通过 set_state 和 get_state 来对 store 进行读写.<br>
+
+## 2.6 StateHolder
+### 2.6.1 _RendezvousStateHolder
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;这个类的作用是**保存与其他节点同步(SYNC)的rendezvous状态**，但是需要一个派生类来完成功能。<br>
+
+### 2.6.2 _BackendRendezvousStateHolder
+_BackendRendezvousStateHolder 继承了 _RendezvousStateHolder。其 sync 就是**调用内部的后端, 对 store 进行读写**。<br>
+
+### 2.6.3 如何使用
+_DistributedRendezvousOpExecutor 中会使用_BackendRendezvousStateHolder. <br>
+
+```python
+def run(
+    self, state_handler: Callable[[_RendezvousContext, float], _Action], deadline: float
+) -> None:
+    """See base class."""
+    action = None
+
+    while action != _Action.FINISH:
+        # Reads or writes the latest rendezvous state shared by all nodes in
+        # the rendezvous. Note that our local changes might get overridden
+        # by another node if that node synced its changes before us.
+        
+        has_set = self._state_holder.sync()  # 这里要同步各种状态，因为最新状态在 rendezvous。
+
+        self._state = self._state_holder.state # 得到最新的状态
+        ctx = _RendezvousContext(self._node, self._state, self._settings)
+
+        # Determine the next action to take based on the current state of
+        # the rendezvous.
+        action = state_handler(ctx, deadline) 
+
+        # 省略部分代码
+
+        if action == _Action.SYNC:
+            # Delay the execution by one second to avoid overloading the
+            # backend if we are asked to poll for state changes.
+            _delay(seconds=1)
+        else:
+            if action == _Action.KEEP_ALIVE:
+                self._keep_alive()
+            elif action == _Action.ADD_TO_PARTICIPANTS:
+                self._add_to_participants()
+            elif action == _Action.ADD_TO_WAIT_LIST:
+                self._add_to_wait_list()
+            elif action == _Action.REMOVE_FROM_PARTICIPANTS:
+                self._remove_from_participants()
+            elif action == _Action.REMOVE_FROM_WAIT_LIST:
+                self._remove_from_wait_list()
+            elif action == _Action.MARK_RENDEZVOUS_COMPLETE:
+                self._mark_rendezvous_complete()
+            elif action == _Action.MARK_RENDEZVOUS_CLOSED:
+                self._mark_rendezvous_closed()
+
+            # Attempt to sync our changes back to other nodes.
+            self._state_holder.mark_dirty() # 再次同步，把自己状态同步给其他节点
+```
+
+## 2.7 目前为止的逻辑
+```python
+                                                                       +
++-------------------------------+                                      |                                        +-------------------------------+
+| _BackendRendezvousStateHolder |                                      |                                        | _BackendRendezvousStateHolder |
+|                               |     +-------------------+            |           +--------------------+       |                               |
+|             _settings +-----------> | RendezvousSettings|            |           | RendezvousSettings | <----------+ _settings                |
+|                               |     +-------------------+            |           +--------------------+       |                               |
+|                               |     +-------------------+            |           +--------------------+       |                               |
+|             _state +--------------> | _RendezvousState  |            |           | _RendezvousState   | <----------+ _state                   |
+|                               |     |                   |            |           |                    |       |                               |
+|                               |     +-------------------+            |           +--------------------+       |                               |
+|                               |                                      |                                        |                               |
+|                               |     +-----------------------+        +           +----------------------+     |                               |
+|             _backend +------------> | C10dRendezvousBackend |                    | C10dRendezvousBackend| <-------+  _backend                 |
+|                               |     |                       |    +---------+     |                      |     |                               |
+|                               |     |             _store +-----> |TCPStore | <---------+ _store         |     |                               |
+|                               |     |                       |    |         |     |                      |     |                               |
+|                               |     +-----------------------+    +---------+     +----------------------+     |                               |
+|                               |                                                                               |                               |
+|                               |         ^                            +                       ^                |                               |
+|                               |         |                            |                       |                |                               |
+|                               |         |                            |                       |                |                               |
+|             sync +----------------------+                            |                       +---------------------+  sync                    |
+|                               |   set_state                          |                         set_state      |                               |
++-------------------------------+                                      +                                        +-------------------------------+
+```
+
+# 3 动态逻辑
+
+
+
+
+
+
 
 
