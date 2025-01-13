@@ -79,6 +79,7 @@ Future 提供了错误处理机制，允许调用者在尝试获取结果时捕�
 - 用法：在使用FileStore时，需要指定一个文件路径来存储键值对。多个进程可以访问同一个文件路径来共享数据。<br>
 
 ## 3.3 Store UML
+
 ![Store UML](images/store.jpg)
 
 # 4 c++ process group
