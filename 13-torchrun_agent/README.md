@@ -519,6 +519,8 @@ def _assign_worker_ranks(
 ## 4.6 启动 workers 进程
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;派生类的 _start_workers 来启动 worker 进程，因此基类这里没有实现, 在LocalElasticAgent里有实现。<br>
 
+**注意：这里会为envs[local_rank] 设定具体的 worker_env 环境变量，并在此环境变量下启动 start_processes** <br>
+
 ```python
 @prof
 def _start_workers(self, worker_group: WorkerGroup) -> Dict[int, Any]:
