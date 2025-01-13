@@ -1,8 +1,231 @@
-# 0 progress group
+# 1 progress group 相关类 和 通信算子的调用
+## 1.1 python 侧通信算子调用接口
+- [distributed_c10d.py](https://github.com/pytorch/pytorch/blob/main/torch/distributed/distributed_c10d.py)
+```python
+# torch/distributed/distributed_c10d.py
+def broadcast(tensor, src, group=None, async_op=False):
+def all_reduce(tensor, op=ReduceOp.SUM, group=None, async_op=False)
+def all_reduce_coalesced(tensors, op=ReduceOp.SUM, group=None, async_op=False)  
+def reduce(tensor, dst, op=ReduceOp.SUM, group=None, async_op=False)
+def all_gather(tensor_list, tensor, group=None, async_op=False)
+def all_gather_coalesced(output_tensor_lists, input_tensor_list, group=None, async_op) 
+def gather(tensor, gather_list=None, dst=0, group=None, async_op=False)
+def scatter(tensor, scatter_list=None, src=0, group=None, async_op=False)
+def reduce_scatter(output, input_list, op=ReduceOp.SUM, group=None, async_op=False)
+def all_to_all(output_tensor_list, input_tensor_list, group=None, async_op=False)
+def all_to_all_single(output,input, output_split_sizes=None,
+                  input_split_sizes=None, group=None, async_op=False)
+def barrier(group=GroupMember.WORLD, async_op=False, device_ids=None)
+```
 
+## 1.2 统一调度到ProcessGroup中的通信算子
+- [ProcessGroup collective method](https://github.com/pytorch/pytorch/blob/main/torch/csrc/distributed/c10d/ProcessGroup.hpp)
 
+**注意：ProcessGroup 统一入口中的通信方法，先调用dispatcher中的collective op, 再用collective op 调用call** <br>
 
-# 1 Work 作用
+```python
+virtual c10::intrusive_ptr<Work> allreduce(
+    std::vector<at::Tensor>& tensors,
+    const AllreduceOptions& opts = AllreduceOptions()) {
+
+  # 从dispater 中获取collective op 然后再执行
+  static auto op =
+      c10::Dispatcher::singleton()
+          .findSchemaOrThrow("c10d::allreduce_", "")
+          .typed<
+              std::tuple<std::vector<at::Tensor>, c10::intrusive_ptr<Work>>(
+                  at::TensorList,
+                  const c10::intrusive_ptr<::c10d::ProcessGroup>&,
+                  const c10::intrusive_ptr<::c10d::ReduceOp>&,
+                  const std::optional<at::Tensor>& sparse_indices,
+                  int64_t)>();
+
+  return std::get<1>(op.call(
+      tensors,
+      c10::intrusive_ptr<ProcessGroup>::unsafe_reclaim_from_nonowning(this),
+      c10::make_intrusive<ReduceOp>(opts.reduceOp),
+      opts.sparseIndices,
+      opts.timeout.count()));
+}
+```
+**问题时这些通信算子(collective op) 是再哪里被注册的呢？** <br>
+
+## 1.3 collective op func 和 register
+- [Ops.cpp](https://github.com/pytorch/pytorch/blob/main/torch/csrc/distributed/c10d/Ops.cpp)
+
+## 1.3.1 通信算子的实现
+```python
+// Return input tensors as output tensors to make inplace allreduce look like
+// a functional API, so that make_fx can correctly build the dependencies in
+// the graph later.
+#define IMPL_ALLREDUCE(DEV)                                                   \
+  std::tuple<std::vector<at::Tensor>, c10::intrusive_ptr<Work>>               \
+      allreduce_##DEV(                                                        \
+          at::TensorList tensors,                                             \
+          const c10::intrusive_ptr<ProcessGroup>& process_group,              \
+          const c10::intrusive_ptr<ReduceOp>& reduce_op,                      \
+          const std::optional<at::Tensor>& sparse_indices,                    \
+          int64_t timeout) {                                                  \
+    auto tensor_vec = tensors.vec();                                          \
+    auto work = process_group->getBackend(c10::DeviceType::DEV) -> allreduce( \
+        tensor_vec,                                                           \
+        AllreduceOptions{                                                     \
+            *reduce_op.get(), std::chrono::milliseconds(timeout)});           \
+    return std::tuple<std::vector<at::Tensor>, c10::intrusive_ptr<Work>>(     \
+        std::move(tensor_vec), work);                                         \
+  }
+
+IMPL_ALLREDUCE(CPU)
+IMPL_ALLREDUCE(CUDA)
+IMPL_ALLREDUCE(PrivateUse1)
+```
+
+**重点: 可以看出，最终通信算子调度到了具体实现后端(eg. ProcessGroupNCCL)的通信方法里。** <br>
+
+### 1.3.2 通信算子的注册
+```python
+// 1st level expansion
+#define REGISTER_C10D_OP(FUNC)  \
+  REGISTER_C10D_OP1(FUNC, CPU)  \
+  REGISTER_C10D_OP1(FUNC, CUDA) \
+  REGISTER_C10D_OP1(FUNC, PrivateUse1)
+
+// Now we start to register ops with the three device keys
+
+REGISTER_C10D_OP(send)
+REGISTER_C10D_OP(recv_)
+REGISTER_C10D_OP(recv_any_source_)
+REGISTER_C10D_OP(reduce_)
+REGISTER_C10D_OP(broadcast_)
+REGISTER_C10D_OP(allreduce_)
+REGISTER_C10D_OP(allreduce_coalesced_)
+REGISTER_C10D_OP(allgather_)
+REGISTER_C10D_OP(_allgather_base_)
+REGISTER_C10D_OP(allgather_coalesced_)
+REGISTER_C10D_OP(allgather_into_tensor_coalesced_)
+REGISTER_C10D_OP(reduce_scatter_)
+REGISTER_C10D_OP(_reduce_scatter_base_)
+REGISTER_C10D_OP(reduce_scatter_tensor_coalesced_)
+REGISTER_C10D_OP(gather_)
+REGISTER_C10D_OP(scatter_)
+REGISTER_C10D_OP(alltoall_)
+REGISTER_C10D_OP(alltoall_base_)
+REGISTER_C10D_OP(barrier)
+```
+
+## 1.4 具体通信后端
+- [ProcessGroupNCCL.cpp](https://github.com/pytorch/pytorch/blob/main/torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp)
+
+```python
+c10::intrusive_ptr<Work> ProcessGroupNCCL::allreduce(
+    std::vector<at::Tensor>& tensors,
+    const AllreduceOptions& opts) {
+  TORCH_CHECK(tensors.size() == 1, MULTI_DEVICE_ERROR_MSG);
+  auto tensor = tensors.back();
+  if (tensor.is_complex()) {
+    TORCH_CHECK(
+        complexViewAsRealAllowed(opts.reduceOp),
+        "all_reduce does not support",
+        opts.reduceOp,
+        "on complex tensors");
+    tensor = at::view_as_real(tensor);
+  }
+  check_gpu_single_tensor(tensor);
+
+  if (intraNodeComm_ != nullptr && opts.reduceOp == ReduceOp::SUM) {
+    using namespace intra_node_comm;
+    auto algo = intraNodeComm_->selectAllReduceAlgo(tensor);
+    if (algo != intra_node_comm::AllReduceAlgo::NONE) {
+      intraNodeComm_->allReduce(tensor, algo);
+      return c10::make_intrusive<IntraNodeCommWork>();
+    }
+  }
+  TORCH_CHECK(
+      !isFloat8Type(tensor.scalar_type()),
+      "Float8 dtypes are not currenlty supported for NCCL reductions");
+  // @lint-ignore CLANGTIDY
+  RECORD_PARAM_COMMS_DATA(
+      static_cast<int>(
+          this->getSequenceNumberForGroup() + 1), // seq + 1 to match collective
+      std::make_tuple(pg_uid_, pg_desc_), // PG name tuple
+      tensors, // inputTensors
+      tensors, // outputTensors
+      rank_, // rank
+      "allreduce", // collective name
+      tensor.numel(), // inNelems
+      tensor.numel(), // outNelems
+      tensor.scalar_type(), // dType
+      std::vector<int64_t>(), // inSplitSizes
+      std::vector<int64_t>(), // outSplitSizes
+      globalRankStart, // globalRankStart
+      globalRankStride, // globalRankStride
+      this->getSize()); // worldSize
+
+  // avoidRecordStreams_ note: collective() will stash tensors.
+  return allreduce_impl(tensor, opts);
+}
+```
+
+## 1.5 collective op kernel
+### 1.5.1 cuda kernel
+- [https://github.com/pytorch/pytorch/blob/main/torch/csrc/distributed/c10d/intra_node_comm.cu]
+```
+# /root/mtn/pytorch/torch/csrc/distributed/c10d/intra_node_comm.cu
+at::Tensor IntraNodeComm::allReduce(
+    const at::Tensor& input,
+    AllReduceAlgo algo) {
+  // Report usage for testing purposes.
+  // We don't care about overflowing.
+  ++usageCounter;
+  auto stream = at::cuda::getCurrentCUDAStream();
+  c10::cuda::CUDACachingAllocator::recordStream(
+      input.storage().data_ptr(), stream);
+  switch (algo) {
+    case AllReduceAlgo::ONE_SHOT:
+      return oneShotAllReduce(input, stream);
+    case AllReduceAlgo::TWO_SHOT:
+      return twoShotAllReduce(input, stream);
+    case AllReduceAlgo::HCM:
+      return hybridCubeMeshAllReduce(input, stream);
+    default:
+      C10_THROW_ERROR(ValueError, "IntraNodeComm: invalid algo");
+  }
+}
+```
+
+### 1.5.2 调用NCCL 通信库
+- [ProcessGroupNCCL.cpp](https://github1s.com/pytorch/pytorch/blob/main/torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp)
+  
+```python
+# torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp
+c10::intrusive_ptr<Work> ProcessGroupNCCL::allreduce_impl(
+    at::Tensor& tensor,
+    const AllreduceOptions& opts) {
+  return collective(
+      tensor,
+      tensor,
+      [&](at::Tensor& input,
+          at::Tensor& output,
+          ncclComm_t comm,
+          at::cuda::CUDAStream& stream) {
+        auto ncclDataType = getNcclDataType(input.scalar_type());
+        auto ncclReduceOp =
+            getNcclReduceOp(opts.reduceOp, input, ncclDataType, comm);
+        return ncclAllReduce(
+            input.data_ptr(),
+            output.data_ptr(),
+            input.numel(),
+            ncclDataType,
+            ncclReduceOp,
+            comm,
+            stream.stream());
+      },
+      OpType::ALLREDUCE,
+      "nccl:all_reduce");
+}
+```
+
+# 2 Work 作用
 - [Work 类](torch/csrc/distributed/c10d/Work.hpp)
 
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;在 PyTorch 的 csrc/distributed/c10d/Work.hpp 文件中，Work 类是与分布式训练中的异步操作和任务管理相关的核心组件。Work 类的主要作用是封装和管理分布式训练中的异步工作单元，这些工作单元可能涉及跨多个计算节点的数据传输、梯度同步或其他通信操作。<br>
@@ -26,7 +249,7 @@
 
 总的来说，Work 类在 PyTorch 分布式训练中扮演着重要角色，它封装和管理异步操作，提供任务管理和调度功能，支持错误处理和恢复机制，并有助于优化训练性能和实现跨节点通信。<br>
 
-# 2 Future
+# 3 Future
 - [Future 类](pytorch/aten/src/ATen/core/ivalue_inl.h)
 
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;在 /home/mtn_torch/pytorch/aten/src/ATen/core/ivalue_inl.h 文件中，Future 是一个重要的类，它主要用于表示**异步计算**的结果。这个 Future 类是 IValue 类的一个扩展或特化，用于**封装异步操作完成后的返回值**。以下是 Future 在这个上下文中的主要作用：
@@ -50,8 +273,8 @@ Future 提供了错误处理机制，允许调用者在尝试获取结果时捕�
 
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;需要注意的是，Future 的具体实现和使用方式可能因 PyTorch 的版本和构建配置而有所不同。因此，开发者在使用 Future 时需要参考 PyTorch 的官方文档和源代码，以确保正确理解和使用这个类。<br>
 
-# 3 Store
-## 3.1 TCPStore
+# 4 Store
+## 4.1 TCPStore
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;在PyTorch分布式系统中，TCPStore主要用于**进程间的通信和初始化分布式进程组**。TCPStore作为分布式键值存储(KVStore)，允许进程之间共享信息，这在分布式训练中非常重要。<br>
 
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;具体来说，在PyTorch分布式训练中，TCPStore可能用于设置和存储以下类型的数据：<br>
@@ -73,20 +296,20 @@ Future 提供了错误处理机制，允许调用者在尝试获取结果时捕�
 
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;此外，PyTorch还提供了其他初始化方法（如环境变量初始化、共享文件系统初始化等），这些方法可以根据具体的应用场景和需求来选择。在选择初始化方法时，需要考虑系统的可用性、可靠性和性能等因素。<br>
 
-## 3.2 FileStore
+## 4.2 FileStore
 - 作用：FileStore是一个基于文件系统的分布式存储实现，它使用文件来存储键值对。它允许在多个进程之间共享数据，而无需通过网络进行传输。<br>
 - 特点：FileStore的优点是简单且易于实现，因为它依赖于现有的文件系统。然而，它的性能可能受到文件系统I/O性能的限制。它适用于对性能要求不高的分布式应用场景。<br>
 - 用法：在使用FileStore时，需要指定一个文件路径来存储键值对。多个进程可以访问同一个文件路径来共享数据。<br>
 
-## 3.3 Store UML
+## 4.3 Store UML
 
 ![Store UML](images/store.jpg)
 
-# 4 c++ process group
+# 5 c++ process group
 
 ![process group](images/process-group.jpg)
 
-# 5 create process group 
+# 6 create process group 
 
 ![creat process group](images/process-group-create.jpg)
 
