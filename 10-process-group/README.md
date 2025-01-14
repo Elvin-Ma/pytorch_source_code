@@ -225,6 +225,15 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::allreduce_impl(
 }
 ```
 
+## 1.6 ProcessGroup-Store-NCCLComm
+- 进程组实例会**保留对存储Store的引用**，因为在构造函数运行后很长时间内可能还会使用存储。<br>
+- 构造函数不会创建任何 MCCL 通信器（MCCL communicators）。**单个 MCCL 通信器只能用于特定的设备集合，因此它们是在执行集体操作（collective operation）时按需创建的**。<br>
+- 如果之后执行另一个集体操作，针对不同的设备集合，进程组会创建另一个 MCCL 通信器。这些 MCCL 通信器会**被缓存并在可能的情况下重用**。<br>
+
+## 1.7 创建多个进程组
+- 如果需要创建多个进程组，每个进程组可能有不同的 rank（进程编号）和 size（进程数量），可以通过为每个进程组传递一个新的存储实例来实现。<br>
+- 如果只有一个存储对象，可以使用 c10d::PrefixStore 来派生作用域实例。这也是 torch.distributed Python API 的做法。<br>
+
 # 2 Work 作用
 - [Work 类](torch/csrc/distributed/c10d/Work.hpp)
 
