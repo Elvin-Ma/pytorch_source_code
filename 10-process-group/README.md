@@ -131,8 +131,15 @@ IMPL_ALLREDUCE(PrivateUse1)
 
 **重点: 可以看出，最终通信算子调度到了具体实现后端(eg. ProcessGroupNCCL)的通信方法里。** <br>
 
-### 1.3.2 通信算子的注册
-```python
+### 1.3.2 通信算子的注册 ： 注册到 c10d, 命名空间下
+```c++
+// FUNC: op name
+// DEV: device
+#define REGISTER_C10D_OP1(FUNC, DEV) \
+  TORCH_LIBRARY_IMPL(c10d, DEV, m) { \
+    m.impl(#FUNC, FUNC##DEV);        \
+  }
+
 // 1st level expansion
 #define REGISTER_C10D_OP(FUNC)  \
   REGISTER_C10D_OP1(FUNC, CPU)  \
