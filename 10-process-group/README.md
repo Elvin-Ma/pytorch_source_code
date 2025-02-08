@@ -26,7 +26,7 @@ def barrier(group=GroupMember.WORLD, async_op=False, device_ids=None)
 - [python 侧 _functional_collectioves.py接口](https://github.com/pytorch/torch/distributed/_functional_collectives.py)
 
 **该接口调度的是这里注册的算子：** <br>
-[Functional.cpp](https://github.com/pytorch/torch/csrc/distributed/c10d/Functional.cpp)
+- [Functional.cpp](https://github.com/pytorch/torch/csrc/distributed/c10d/Functional.cpp)
 
 ```c++
 TORCH_LIBRARY(_c10d_functional, m) {
