@@ -1,5 +1,7 @@
 # 1 progress group 相关类 和 通信算子的调用
-## 1.1 python 侧通信算子调用接口
+## 1.1 python 侧通信算子（comm ops）调用接口
+
+### 1.1.1 c10d 命名空间中的调用
 - [distributed_c10d.py](https://github.com/pytorch/pytorch/blob/main/torch/distributed/distributed_c10d.py)
 ```python
 # torch/distributed/distributed_c10d.py
@@ -16,6 +18,53 @@ def all_to_all(output_tensor_list, input_tensor_list, group=None, async_op=False
 def all_to_all_single(output,input, output_split_sizes=None,
                   input_split_sizes=None, group=None, async_op=False)
 def barrier(group=GroupMember.WORLD, async_op=False, device_ids=None)
+```
+
+*注意：这些python侧算子通过ProcessGroup的方法来调度具体的通信算子。**
+
+### 1.1.2 _c10d_functional 命名空间中的调用
+- [python 侧 _functional_collectioves.py接口](https://github.com/pytorch/torch/distributed/_functional_collectives.py)
+
+**该接口调度的是这里注册的算子：** <br>
+[Functional.cpp](https://github.com/pytorch/torch/csrc/distributed/c10d/Functional.cpp)
+
+```c++
+TORCH_LIBRARY(_c10d_functional, m) {
+  m.def(
+      "all_reduce(Tensor input, str reduce_op, str group_name) -> Tensor",
+      torch::dispatch(
+          c10::DispatchKey::CompositeExplicitAutograd, ::all_reduce),
+      {at::Tag::pt2_compliant_tag});
+
+  m.def(
+      "all_reduce_(Tensor(a!) input, str reduce_op, str group_name) -> Tensor(a!)",
+      torch::dispatch(
+          c10::DispatchKey::CompositeExplicitAutograd, ::all_reduce_),
+      {at::Tag::pt2_compliant_tag});
+
+  ...
+```
+
+**这里的算子其实还是会通过ProcessGroup来调度具体的通信算子** <br>
+```c++
+std::vector<at::Tensor> all_gather_into_tensor_coalesced(
+    std::vector<at::Tensor> inputs,
+    int64_t group_size,
+    // NOLINTNEXTLINE(performance-unnecessary-value-param)
+    std::string group_name) {
+  std::vector<at::Tensor> outputs;
+  outputs.reserve(inputs.size());
+  for (const auto& tensor : inputs) {
+    outputs.push_back(allocate_all_gather_output(tensor, group_size));
+  }
+
+  auto group = c10d::resolve_process_group(group_name);
+  auto work = group->allgather_into_tensor_coalesced(outputs, inputs);
+  for (const auto& tensor : outputs) {
+    c10d::register_work(tensor, work);
+  }
+  return outputs;
+}
 ```
 
 ## 1.2 统一调度到ProcessGroup中的通信算子
