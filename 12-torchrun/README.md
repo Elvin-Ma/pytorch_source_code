@@ -13,6 +13,104 @@ if __name__ == '__main__':
     sys.exit(main())
 ```
 
+**torchrun 启动多进程调用栈** <br>
+```python
+ /opt/conda/envs/py310/bin/torchrun(33)<module>()
+     31 if __name__ == '__main__':
+     32     sys.argv[0] = re.sub(r'(-script\.pyw?|\.exe)?$', '', sys.argv[0])
+---> 33     sys.exit(load_entry_point('torch==2.5.0', 'console_scripts', 'torchrun')())
+
+  /opt/conda/envs/py310/lib/python3.10/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py(355)wrapper()
+    354             try:
+--> 355                 return f(*args, **kwargs)
+    356             except SystemExit as se:
+
+  /opt/conda/envs/py310/lib/python3.10/site-packages/torch/distributed/run.py(919)main()
+    918     args = parse_args(args)
+--> 919     run(args)
+    920
+
+  /opt/conda/envs/py310/lib/python3.10/site-packages/torch/distributed/run.py(910)run()
+    909     config, cmd, cmd_args = config_from_args(args)
+--> 910     elastic_launch(
+    911         config=config,
+
+  /opt/conda/envs/py310/lib/python3.10/site-packages/torch/distributed/launcher/api.py(138)__call__()
+    137     def __call__(self, *args):
+--> 138         return launch_agent(self._config, self._entrypoint, list(args))
+    139
+
+  /opt/conda/envs/py310/lib/python3.10/site-packages/torch/distributed/launcher/api.py(261)launch_agent()
+    260
+--> 261         result = agent.run()
+    262         # records that agent.run() has succeeded NOT that workers have succeeded
+
+  /opt/conda/envs/py310/lib/python3.10/site-packages/torch/distributed/elastic/metrics/api.py(137)wrapper()
+    136                 start = time.time()
+--> 137                 result = f(*args, **kwargs)
+    138                 put_metric(f"{key}.success", 1, group)
+
+  /opt/conda/envs/py310/lib/python3.10/site-packages/torch/distributed/elastic/agent/server/api.py(696)run()
+    695         try:
+--> 696             result = self._invoke_run(role)
+    697             self._total_execution_time = int(time.monotonic() - start_time)
+
+  /opt/conda/envs/py310/lib/python3.10/site-packages/torch/distributed/elastic/agent/server/api.py(849)_invoke_run()
+    848
+--> 849         self._initialize_workers(self._worker_group)
+    850         monitor_interval = spec.monitor_interval
+
+  /opt/conda/envs/py310/lib/python3.10/site-packages/torch/distributed/elastic/metrics/api.py(137)wrapper()
+    136                 start = time.time()
+--> 137                 result = f(*args, **kwargs)
+    138                 put_metric(f"{key}.success", 1, group)
+
+  /opt/conda/envs/py310/lib/python3.10/site-packages/torch/distributed/elastic/agent/server/api.py(671)_initialize_workers()
+    670         logger.info("[%s] Starting worker group", role)
+--> 671         worker_ids = self._start_workers(worker_group)
+    672         for local_rank, w_id in worker_ids.items():
+
+  /opt/conda/envs/py310/lib/python3.10/site-packages/torch/distributed/elastic/metrics/api.py(137)wrapper()
+    136                 start = time.time()
+--> 137                 result = f(*args, **kwargs)
+    138                 put_metric(f"{key}.success", 1, group)
+
+  /opt/conda/envs/py310/lib/python3.10/site-packages/torch/distributed/elastic/agent/server/local_elastic_agent.py(344)_start_workers()
+1   343         assert self._logs_specs is not None
+--> 344         self._pcontext = start_processes(
+    345             name=spec.role,
+
+  /opt/conda/envs/py310/lib/python3.10/site-packages/torch/distributed/elastic/multiprocessing/__init__.py(229)start_processes()
+    228     try:
+--> 229         context.start()
+    230         return context
+
+  /opt/conda/envs/py310/lib/python3.10/site-packages/torch/distributed/elastic/multiprocessing/api.py(485)start()
+    484             )
+--> 485         self._start()
+    486         self._stdout_tail.start()
+
+  /opt/conda/envs/py310/lib/python3.10/site-packages/torch/distributed/elastic/multiprocessing/api.py(829)_start()
+    828             )
+--> 829         self.subprocess_handlers = {
+    830             local_rank: get_subprocess_handler(
+
+  /opt/conda/envs/py310/lib/python3.10/site-packages/torch/distributed/elastic/multiprocessing/api.py(830)<dictcomp>()
+    829         self.subprocess_handlers = {
+--> 830             local_rank: get_subprocess_handler(
+    831                 entrypoint=self.entrypoint,  # type: ignore[arg-type] # entrypoint is always a str
+
+  /opt/conda/envs/py310/lib/python3.10/site-packages/torch/distributed/elastic/multiprocessing/subprocess_handler/handlers.py(27)get_subprocess_handler()
+     26 ):
+---> 27     return SubprocessHandler(
+     28         entrypoint=entrypoint,
+
+> /opt/conda/envs/py310/lib/python3.10/site-packages/torch/distributed/elastic/multiprocessing/subprocess_handler/subprocess_handler.py(51)__init__()
+     50         self.local_rank_id = local_rank_id
+---> 51         self.proc: subprocess.Popen = self._popen(args_str, env_vars)
+     52
+```
+
 # 1 torch.distributed.run
 - torchrun 多进程启动流程如下：<br>
 ![torchrun](images/torchrun.png)
@@ -156,7 +254,7 @@ if __name__ == '__main__':
 
 ```python
 rank, world_size = self._get_world()
-    
+
 def _get_world(self) -> Tuple[int, int]:
 	state = self._state_holder.state
 	return state.participants[self._this_node], len(state.participants)
@@ -408,7 +506,7 @@ def launch_agent(
 ### 7.3.1 WorkSpec
 WorkerSpec ：这是配置信息，里面包含了代理所需要的某些全局信息，比如 RendezvousHandler，role，entry（用户函数）。<br>
 ```python
-spec = {WorkerSpec} 
+spec = {WorkerSpec}
    args = {tuple: 2} (tensor, tensor)
    fn = {NoneType} None
    local_world_size = {int} 1
