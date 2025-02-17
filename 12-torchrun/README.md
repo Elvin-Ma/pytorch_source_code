@@ -111,6 +111,13 @@ if __name__ == '__main__':
      52
 ```
 
+**不同多进程启动方式间的区别** <br>
+
+- 功能定位：subprocess.Popen用于执行外部命令，而multiprocessing.popen_fork.Popen/multiprocessing.popen_spawn_posix/Popen(class Popen(popen_fork.Popen):)用于启动新的Python进程以实现并行计算。
+- 工作原理：前者通过操作系统级别的调用来启动任意可执行文件；后者则通过复制当前进程的方式来启动新的Python解释器实例。
+- 应用场景：根据需求选择合适的方法——如果你需要运行外部命令或脚本，使用subprocess；若是要并行化Python代码，则应考虑multiprocessing。
+
+
 # 1 torch.distributed.run
 - torchrun 多进程启动流程如下：<br>
 ![torchrun](images/torchrun.png)
