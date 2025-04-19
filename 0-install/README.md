@@ -26,6 +26,8 @@ export USE_DISTRUBUTED=1
 export USE_OPENCV=0
 export CMAKE_BUILD_TYPE=Debug
 export MAX_JOBS=16
+export CMAKE_PREFIX_PATH="${CONDA_PREFIX:-'$(dirname $(which conda))/../'}:${CMAKE_PREFIX_PATH}"
+export CMAKE_POLICY_VERSION_MINIMUM=3.5
 python3 setup.py bdist_wheel
 # sudo CMAKE_BUILD_TYPE=Debug python3 setup.py develop
 ```
