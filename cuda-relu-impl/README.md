@@ -534,9 +534,3 @@ struct unroll {
   }
 };
 ```
-
-# 6 struct TORCH_API TensorIteratorBase : public impl::MetaBase
-
-&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;inputs 和 outputs 都用统一的 TensorIteratorBase 进行封装, 因此需要了解下TensorIteratorBase的用法。
-
-- /root/projects/pytorch/torch/include/ATen/TensorIterator.h
