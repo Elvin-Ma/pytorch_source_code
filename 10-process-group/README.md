@@ -7,10 +7,10 @@
 # torch/distributed/distributed_c10d.py
 def broadcast(tensor, src, group=None, async_op=False):
 def all_reduce(tensor, op=ReduceOp.SUM, group=None, async_op=False)
-def all_reduce_coalesced(tensors, op=ReduceOp.SUM, group=None, async_op=False)  
+def all_reduce_coalesced(tensors, op=ReduceOp.SUM, group=None, async_op=False)
 def reduce(tensor, dst, op=ReduceOp.SUM, group=None, async_op=False)
 def all_gather(tensor_list, tensor, group=None, async_op=False)
-def all_gather_coalesced(output_tensor_lists, input_tensor_list, group=None, async_op) 
+def all_gather_coalesced(output_tensor_lists, input_tensor_list, group=None, async_op)
 def gather(tensor, gather_list=None, dst=0, group=None, async_op=False)
 def scatter(tensor, scatter_list=None, src=0, group=None, async_op=False)
 def reduce_scatter(output, input_list, op=ReduceOp.SUM, group=None, async_op=False)
@@ -251,7 +251,7 @@ at::Tensor IntraNodeComm::allReduce(
 
 ### 1.5.2 调用NCCL 通信库
 - [ProcessGroupNCCL.cpp](https://github1s.com/pytorch/pytorch/blob/main/torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp)
-  
+
 ```python
 # torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp
 c10::intrusive_ptr<Work> ProcessGroupNCCL::allreduce_impl(
@@ -374,13 +374,6 @@ Future 提供了错误处理机制，允许调用者在尝试获取结果时捕�
 
 ![process group](images/process-group.jpg)
 
-# 6 create process group 
+# 6 create process group
 
 ![creat process group](images/process-group-create.jpg)
-
-
-
-
-
-
-
