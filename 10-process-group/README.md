@@ -20,7 +20,7 @@ def all_to_all_single(output,input, output_split_sizes=None,
 def barrier(group=GroupMember.WORLD, async_op=False, device_ids=None)
 ```
 
-> 注意：这些python侧算子内通过ProcessGroup的方法来调度具体的通信算子
+> 注意：这些python侧算子内通过**ProcessGroup的方法**来调度具体的通信算子
 
 ```python
 # torch/distributed/distributed_c10d.py
