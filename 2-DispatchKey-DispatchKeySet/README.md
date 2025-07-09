@@ -1,37 +1,121 @@
 # 1 DispatchKey 的基础数据结构及概念介绍
 
-## 1.1 相关定义
-- [Note: Per-Backend Functionality Dispatch Keys]
-&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;检查一个dispatch key是否为按后端划分的functionality键,任何可以按后端进行自定义的functionality都应添加至此。<br>
-&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;这些key对应于可以按后端单独自定义的功能。虽然它们在DispatchKeySet bitset中仅占用一个bit，但在operator table中，它们会映射到（#后端数量）个槽位(slots)。<br>
-&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;对于每个后端，这些key在dispatch enum中还有一组单独的“runtime keys”，这些runtime keys确实会映射到operator table中的单独槽位(slots)。<br>
+## 1.1 DispatchKey 与 DispatchKeySet repr_ 对应
+到pytorch v2.5.0 和 v2.6.0 DispatchKey enum 有 149 个枚举项. 这些枚举项大致分为功能键、后端键、别名键和后向兼容键， 这些键虽有很多，但**通过DispatchKeySet里一个int64 类型的repr_ 即可完全确定其查找时的槽位：** <br>
+
+- 每个 DispatchKey 对应**repr_里**一个 bit；
+- 前 48 bits（0~47）分配给了功能性键（Functionality Keys）；
+- 剩余 16 bits（48~63）分配给传统后端（BackendComponent）；
+- DispatchKeySet 使用这个 bitset 来判断张量具备哪些功能、属于哪个后端；
+- 功能键(funtionality keys)用于控制张量的行为（如是否稀疏、是否量化等），而后端键用于调度操作在哪个设备上执行（如 CPU、CUDA）。
+
+## 1.2 详细分类
+1. **构建块键（Building block keys）**
+   - **定义**：这些是构成更复杂调度键的基础组件。它们分为两类：
+     - **后端构建块（Backend building blocks）**：例如`CPUBit`、`CUDABit`，代表硬件后端的基础标识。
+     - **功能构建块（Functionality building blocks）**：例如`Dense`、`Sparse`、`AutogradFunctionality`，代表跨后端的功能类别。
+   - **特点**：
+     - 它们是“原子”键，用于组合成运行时键。
+     - 每个构建块键在`DispatchKeySet`中占据一个独立的位（bit）。
+     - 它们本身并不直接用于内核注册，而是通过组合形成实际的运行时键。
+   - **目的**：避免为每个可能的组合（如`SparseCPU`）都分配一个独立的位，从而节省位空间。
+2. **运行时键（Runtime keys）**
+   - **定义**：这些键直接对应于操作符分派表中的槽位，是实际用于内核注册和调度的键。分为三类：
+     - **不可定制的后端（Non-customizable backends）**：例如`FPGA`，这些后端不能自定义功能（如没有`SparseFPGA`）。
+     - **不可定制的功能（Non-customizable functionalities）**：例如`Functionalize`，这些功能不按后端拆分（即没有`FunctionalizeCPU`）。
+     - **可定制的实例（Per-backend instances）**：例如`CPU`、`SparseCPU`、`AutogradCPU`。这些是由**构建块键组合**而成的键，代表特定后端上的特定功能。
+   - **特点**：
+     - 每个运行时键在操作符的分派表中都有一个对应的槽位。
+     - 开发者可以直接将内核注册到运行时键（如`m.impl("add", DispatchKey::CPU, &cpu_kernel)`）。
+     - 部分运行时键由构建块键组合而成（如`CPU = CPUBit + Dense`），而另一些（如`FPGA`）是独立的。
+3. **“别名” `DispatchKey`**（见注释 [别名调度键]）
+
+## 1.3 而具体的DispatchKey
+
+| 类别 | 设计目的 | 优先级 | enum 范围 | 典型键值 |
+| ---- | ---- | ---- | ---- | ---- |
+| 功能key | 实现跨设备抽象功能 | 高 | 1- 47 (47个)| Dense FPGA MAIA Vulkan Metal Quantized CustomRNGKeyId MkldnnCPU Sparse SparseCsr NestedTensor BackendSelect Python Fake FuncTorchDynamicLayerBackMode Functionalize Named Conjugate Negative ZeroTensor ADInplaceOrView AutogradOther AutogradFunctionality AutogradNestedTensor Tracer AutocastCPU AutocastXPU AutocastIPU AutocastHPU AutocastXLA AutocastMPS AutocastCUDA AutocastPrivateUse1 FuncTorchBatched BatchedNestedTensor FuncTorchVmapMode Batched VmapMode FuncTorchGradWrapper DeferredInit PythonTLSSnapshot FuncTorchDynamicLayerFrontMode TESTING_ONLY_GenericWrapper TESTING_ONLY_GenericMode PreDispatch PythonDispatcher EndOfFunctionalityKeys|
+| 后端key | 绑定特定硬件计算实现(通过宏展开来实现) | 中 | 48-143(95个) | StartOfDenseBackends, CPU, CUDA, HIP, XLA, MPS, IPU, XPU, HPU, VE, Lazy, MTIA, PrivateUse1, PrivateUse2, PrivateUse3, Meta, EndOfDenseBackends = Meta|
+| 后端key | 绑定特定硬件计算实现(通过宏展开来实现) | 中 | 48-143(95个) | StartOfQuantizedBackends, QuantizedCPU, QuantizedCUDA, QuantizedHIP, QuantizedXLA, QuantizedMPS, QuantizedIPU, QuantizedXPU, QuantizedHPU, QuantizedVE, QuantizedLazy, QuantizedMTIA, QuantizedPrivateUse1, QuantizedPrivateUse2, QuantizedPrivateUse3, QuantizedMeta, EndOfQuantizedBackends = QuantizedMeta |
+| 后端key | 绑定特定硬件计算实现(通过宏展开来实现) | 中 | 48-143(95个) | StartOfSparseBackends, SparseCPU, SparseCUDA, SparseHIP, SparseXLA, SparseMPS, SparseIPU, SparseXPU, SparseHPU, SparseVE, SparseLazy, SparseMTIA, SparsePrivateUse1, SparsePrivateUse2, SparsePrivateUse3, SparseMeta, EndOfSparseBackends = SparseMeta|
+| 后端key | 绑定特定硬件计算实现(通过宏展开来实现) | 中 | 48-143(95个) | StartOfSparseCsrBackends, SparseCsrCPU, SparseCsrCUDA, SparseCsrHIP, SparseCsrXLA, SparseCsrMPS, SparseCsrIPU, SparseCsrXPU, SparseCsrHPU, SparseCsrVE, SparseCsrLazy, SparseCsrMTIA, SparseCsrPrivateUse1, SparseCsrPrivateUse2, SparseCsrPrivateUse3, SparseCsrMeta, EndOfSparseCsrBackends = SparseCsrMeta|
+| 后端key | 绑定特定硬件计算实现(通过宏展开来实现) | 中 | 48-143(95个) | StartOfNestedTensorBackends, NestedTensorCPU, NestedTensorCUDA, NestedTensorHIP, NestedTensorXLA, NestedTensorMPS, NestedTensorIPU, NestedTensorXPU, NestedTensorHPU, NestedTensorVE, NestedTensorLazy, NestedTensorMTIA, NestedTensorPrivateUse1, NestedTensorPrivateUse2, NestedTensorPrivateUse3, NestedTensorMeta, EndOfNestedTensorBackends = NestedTensorMeta |
+| 后端key | 绑定特定硬件计算实现(通过宏展开来实现) | 中 | 48-143(95个) | StartOfAutogradFunctionalityBackends, AutogradCPU, AutogradCUDA, AutogradHIP, AutogradXLA, AutogradMPS, AutogradIPU, AutogradXPU, AutogradHPU, AutogradVE, AutogradLazy, AutogradMTIA, AutogradPrivateUse1, AutogradPrivateUse2, AutogradPrivateUse3, AutogradMeta, EndOfAutogradFunctionalityBackends = AutogradMeta|
+  CompositeImplicitAutogradNestedTensor, // registered at
+| 别名key | 简化组合功能注册 | 依赖组合 | 144-149(6个) | Autograd, CompositeImplicitAutograd，FuncTorchBatchedDecomposition，CompositeImplicitAutogradNestedTensor, CompositeExplicitAutograd, CompositeExplicitAutogradNonFunctional, StartOfAliasKeys = Autograd, EndOfAliasKeys = CompositeExplicitAutogradNonFunctional|
+|向后兼容的别名|为兼容旧版本| --| 7 | CPUTensorId = CPU, CUDATensorId = CUDA, DefaultBackend = CompositeExplicitAutograd, PrivateUse1_PreAutograd = AutogradPrivateUse1,  PrivateUse2_PreAutograd = AutogradPrivateUse2,PrivateUse3_PreAutograd = AutogradPrivateUse3, Autocast = AutocastCUDA |
+
+
+其中后端key 是具体执行的kernel, 由 支持的后端 和 Functionality key 排列组合得到: 15 x 6 = 90个 <br>
+
+```c++
+#define C10_FORALL_BACKEND_COMPONENTS(_, extra) \
+  _(CPU, extra)                                 \
+  _(CUDA, extra)                                \
+  _(HIP, extra)                                 \
+  _(XLA, extra)                                 \
+  _(MPS, extra)                                 \
+  _(IPU, extra)                                 \
+  _(XPU, extra)                                 \
+  _(HPU, extra)                                 \
+  _(VE, extra)                                  \
+  _(Lazy, extra)                                \
+  _(MTIA, extra)                                \
+  _(PrivateUse1, extra)                         \
+  _(PrivateUse2, extra)                         \
+  _(PrivateUse3, extra)                         \
+  _(Meta, extra)
+
+// WARNING!  If we add a new per-backend functionality key that has higher
+// priority than Autograd, then make sure you update EndOfRuntimeBackendKeys
+
+#define C10_FORALL_FUNCTIONALITY_KEYS(_) \
+  _(Dense, )                             \
+  _(Quantized, Quantized)                \
+  _(Sparse, Sparse)                      \
+  _(SparseCsr, SparseCsr)                \
+  _(NestedTensor, NestedTensor)          \
+  _(AutogradFunctionality, Autograd)
+```
+
+
+## 1.4 [Note: Per-Backend Functionality Dispatch Keys]
+
+**如何用少量bit对应多个函数槽位** <br>
+
+- 检查一个dispatch key是否为按后端划分的functionality键,任何可以按后端进行自定义的functionality都应添加至此。<br>
+- 这些key对应于可以按后端单独自定义的功能。**虽然它们在DispatchKeySet bitset中仅占用一个bit，但在operator table中，它们会映射到（#后端数量）个槽位(slots)**。<br>
+- 对于每个后端，这些key在dispatch enum中还有一组单独的“runtime keys”，这些runtime keys确实会映射到operator table中的**单独槽位**(slots)。<br>
 
 **example:** <br>
-&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;“Sparse”键在DispatchKeySet中映射到一个单独的位，而SparseCPU、SparseCUDA等则分别映射到运行时运算符表中的单独槽位(slots)。<br>
+- “Sparse”键在DispatchKeySet中映射到一个单独的位，而SparseCPU、SparseCUDA等则分别映射到运行时运算符表中的单独槽位(slots)。<br>
 
 - BackendComponent
+```c++
 enum class BackendComponent : uint8_t {
-    InvalidBit = 0,    
-    CPUBit, 
-    CUDABit, 
-    HIPBit, 
-    XLABit, 
-    MPSBit, 
-    IPUBit, 
-    XPUBit, 
-    HPUBit, 
-    VEBit, 
-    LazyBit, 
-    MTIABit, 
-    PrivateUse1Bit, 
-    PrivateUse2Bit, 
-    PrivateUse3Bit, 
+    InvalidBit = 0,
+    CPUBit,
+    CUDABit,
+    HIPBit,
+    XLABit,
+    MPSBit,
+    IPUBit,
+    XPUBit,
+    HPUBit,
+    VEBit,
+    LazyBit,
+    MTIABit,
+    PrivateUse1Bit,
+    PrivateUse2Bit,
+    PrivateUse3Bit,
     MetaBit,
     EndOfBackendKeys = MetaBit,
 }
+```
 
-- Out-of-tree vmap+grad prototype keys （非主仓需要用到的key）
-以下键用于实现位于https://github.com/zou3519/functorch的out-of-tree可组合函数变换（vmap+grad）原型。我们计划最终将该原型整合进核心库，届时它将采用一个不同的设计，该设计应使用更少的键。<br>
+## 1.5 Out-of-tree vmap+grad prototype keys （非主仓需要用到的key）
+
+- 以下键用于实现位于https://github.com/zou3519/functorch的out-of-tree可组合函数变换（vmap+grad）原型。我们计划最终将该原型整合进核心库，届时它将采用一个不同的设计，该设计应使用更少的键。<br>
 ```c++
 case DispatchKey::FuncTorchDynamicLayerFrontMode:
     return "FuncTorchDynamicLayerFrontMode";
@@ -45,7 +129,7 @@ case DispatchKey::PythonDispatcher:
     return "PythonDispatcher";
 ```
 
-- [Functionalization Pass In Core]
+## 1.6 [Functionalization Pass In Core]
 ```c++
 // */pytorch/aten/src/ATen/FunctionalTensorWrapper.h
 // The Functionalization pass is used to remove aliasing from a pytorch program.
@@ -82,7 +166,8 @@ case DispatchKey::PythonDispatcher:
 // machinery. See Note [Functionalization: Mutation Removal] for details on
 // mutation removal.
 ```
-- Fallthrough 机制
+
+## 1.7 Fallthrough 机制
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Fallthrough机制是指当某个特定分发键没有注册的内核实现时，操作会“落空”到一个默认行为。这是 PyTorch 分发机制的一部分，用于处理未实现特定后端的情况，确保操作在这种情况下不会崩溃或抛出错误。 PyTorch 的操作分发系统非常复杂，涉及多个后端（如 CPU、CUDA、XLA 等）和功能键（如 Autograd、Sparse 等）。每个操作（如矩阵乘法、卷积等）都可以有针对不同后端和功能键的具体实现。然而，并不是每个操作在每个后端或功能键下都有具体实现。这时，Fallthrough机制就起作用了。 比如我们在实现一个新的后端的时候，我们可能并不能一下子把所有的算子都按照新的后端在优化实现，这个时候就可以借助Fallthrough机制，让暂时没有实现的算子回落到其它后端比如CPU上执行。 比如:<br>
 ```c++
 namespace at {
@@ -134,8 +219,9 @@ DispatchKeySet getRuntimeDispatchKeySet(DispatchKey t) {
 # 2 DispatchKey 详解
 ```c++
 // 从语义上讲，一个dispatch key标识了函数dispatch中的一个**可能的**级别，在这个级别上可以注册一个函数句柄。每个函数句柄对应functionality的一种类型。<br>
+
 // 从实现的角度来看，dispatch key 标识了 DispatchKeySet中一个特定的bit。更高的位(bit)索引会优先被分发处理(因为我们在提取最高优先级的dispatch key时，会计算前导零(count leading zeros)的数量。）<br>
-//
+
 // 注释: [DispatchKey 的分类]
 // 这个枚举实际上包含了多个类型的键，这些键的详细说明在后面会有更详细的解释：
 // (1) 非可定制化的后端(例如 FPGA)
@@ -143,6 +229,7 @@ DispatchKeySet getRuntimeDispatchKeySet(DispatchKey t) {
 // (3) 可为每个后端定制功能化functionalized(例如 Dense, Quantized, Sparse, AutogradFunctionality, NestedTensor)
 // (4) 上述key针对per-backend定制化实例化后的functionalities(CPU, QuantizedCPU, SparseCPU, AutogradCPU, NestedTensorCPU)
 // (5) alias keys(例如 CompositeImplicitAutograd)
+
 // 以上分类中，需要注意的是：
 // (a) 哪些key被分配到 DispatchKeySet 中的单独的位
 // (b) 哪些键被分配到运行时 operator 表中的单独的槽位("Runtime keys") --> 即那些key被分配到OperatorEntry中的operators_ array中。
@@ -175,7 +262,7 @@ enum class DispatchKey : uint16_t {
   // 以下是不可扩展的后端。这些后端目前没有针对Autograd/Sparse/Quantized内核的自定义实现，因此我们不会在运行时运算符表中为它们分配空间以避免浪费。
   // 如果将来这些后端中的任何一个需要自定义，例如Autograd，那么我们将需要为它们添加一个DispatchKey::*Bit。
   // TODO: put this in BackendComponents --> 将来可能会将其放到BackendComponents中
-  FPGA = 2, // Xilinx support lives out of tree at https://gitlab.com/pytorch-complex/vitis_kernels  
+  FPGA = 2, // Xilinx support lives out of tree at https://gitlab.com/pytorch-complex/vitis_kernels
   // TODO: put this in BackendComponents
   // ONNX Runtime, lives out of tree at https://github.com/pytorch/ort and
   // https://github.com/microsoft/onnxruntime, and is also used to test general
@@ -186,7 +273,7 @@ enum class DispatchKey : uint16_t {
   ORT = 3,       // onnx runtime backend
   Vulkan = 4,    // TODO: put this in BackendComponents
   Metal = 5,     // TODO: put this in BackendComponents
-  
+
   Quantized = 6, // See [Note: Per-Backend Functionality Dispatch Keys]
 
   // 这个后端用于支持自定义的随机数生成器（RNGs）；如果你传入了一个不是传统CPUGeneratorImpl/CUDAGeneratorImpl的生成器，它允许你转向使用不同的内核。要使用这个键：
@@ -198,8 +285,8 @@ enum class DispatchKey : uint16_t {
   // 以下是基于tensor layout指定更专业运算符(more specialized operators)的后端。
   // 请注意，稀疏后端是顺序很重要的一个案例：稀疏多分发与相应的稠密张量一起进行，并且必须在它们之前处理。
   // NB: 不要与MKLDNN混淆, which is Caffe2 only
-  MkldnnCPU = 8, // registered at build/aten/src/ATen/RegisterMkldnnCPU.cpp  
-  Sparse = 9,    // See [Note: Per-Backend Functionality Dispatch Keys]  
+  MkldnnCPU = 8, // registered at build/aten/src/ATen/RegisterMkldnnCPU.cpp
+  Sparse = 9,    // See [Note: Per-Backend Functionality Dispatch Keys]
   SparseCsrCPU = 10,  // TODO: Make SparseCsr a functionality key
   SparseCsrCUDA = 11,
   NestedTensor = 12, // See [Note: Per-Backend Functionality Dispatch Keys]
@@ -215,9 +302,9 @@ enum class DispatchKey : uint16_t {
   // TODO: delete this in favor of Python-implemented fake tensor
   Fake = 15, // 与meta tensor类似，但无数据有device
 
-  // See Note [Out-of-tree vmap+grad prototype]. 
+  // See Note [Out-of-tree vmap+grad prototype].
   // 这个键的目的是在“auto grad subsystem”运行之后插入代码，因此这个键应该紧跟在ADInplaceOrView和所有自动微分键之后。
-  FuncTorchDynamicLayerBackMode = 16, 
+  FuncTorchDynamicLayerBackMode = 16,
 
   // 别名和mutation移除。如果某些后端仅希望选择别名移除或仅选择mutation移除，我们可以考虑添加专门用于这些单独遍历的key。
   // See Note [Functionalization Pass In Core] for details.
@@ -261,7 +348,7 @@ enum class DispatchKey : uint16_t {
   // Note [Alias Dispatch Key : Autograd]
   // 所有后端都未感知到autograd, autograd 被处理为在所有backends的顶层。它检查所有输入的autograd metadata，
   // 确定output应该构造的autograd元数据，并将控制权转移到后端以实际执行数值计算。autograd包含了大部分此逻辑。
-  // 
+  //
   // Autograd 现在是一个dispatch key 的别名，它默认映射到所有后端特定的自动微分（autograd）key。
   // 后端特定的key允许后端根据需要覆盖默认注册到 Autograd key的kernel。
   // 例如，XLA（一种加速线性代数运算的后端）希望直接为 einsum（爱因斯坦求和约定）op定义自动微分。
@@ -269,7 +356,7 @@ enum class DispatchKey : uint16_t {
   // Autograd 键具有更高的优先级，并且会首先被处理。因此，在处理完自动微分之后，通常不应该再进行重新调度.
   // 因为这会导致执行自动微分操作符，而这正是你想要避免的。
   // 在 AutogradXLA 的实现中，你需要自己负责处理自动微分，或者将其委托给其他支持自动微分的操作符。
-  //  
+  //
   // 当前我们只为CPU/CUDA/XLA后端定义了特定的自动微分键，并为用户保留了user-defined backends的空间。
   // 其他in-tree kernel内核共享AutogradOther键。如果有需要，可以为其他后端添加特定的自动微分键。
   AutogradOther = 23,
@@ -351,7 +438,7 @@ enum class DispatchKey : uint16_t {
 #undef DEFINE_PER_BACKEND_KEYS
 #undef DEFINE_PER_BACKEND_KEYS_FOR_BACKEND
 
-      EndOfRuntimeBackendKeys = EndOfAutogradFunctionalityBackends, // 126 
+      EndOfRuntimeBackendKeys = EndOfAutogradFunctionalityBackends, // 126
 
   // ~~~~~~~~~~~~~~~~~~~~~~ Alias Dispatch Keys ~~~~~~~~~~~~~~~~~~~~~~~~~~ //
   // Note [Alias Dispatch Keys]
@@ -401,6 +488,86 @@ StartOfAutogradFunctionalityBackends, AutogradCPU, AutogradCUDA, AutogradHIP, Au
 ```
 
 # 3 DispatchKeySet
+
+![原理图](image.png)
+
+## 3.1 概述
+### DispatchKeySet 表示
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;`DispatchKeySet` 是一组 `DispatchKeys` 的表示。每个张量都持有自己的 `DispatchKeySet`，其中既包含“功能位”，也包含“后端位”。调度器（Dispatcher）通过获取每个输入张量的键集，将它们进行“或”操作合并，然后调度到特定的功能模块。功能位是**有序的**，当多个功能位被设置时，会**使用优先级最高的功能**。类似地，如果调用一个操作时使用了来自不同设备的多个张量（例如 CPU 和 CUDA），理论上可以设置多个后端位，尽管对混合设备调度的支持有限（目前只有接受标量 CPU 张量的 CUDA 内核能优雅地处理混合设备输入）。
+
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;`DispatchKeySet` 表示一组 `DispatchKey` 的集合。一个张量可能有多个张量类型 ID，例如，一个 `Variable` 张量也可以是一个 CPU 张量；`DispatchKeySet` 指定了适用的类型 ID。其内部表示为一个 64-bit 的bit set 位集（这意味着仅支持 64 个张量类型 ID）。
+
+如前所述，`DispatchKey` 是有序的；因此，我们可以问“set中优先级最高的 `DispatchKey` 是什么”？（集合本身是无序的；两个具有相同 ID 的集合，其 ID 的顺序总是相同的。）
+
+#### 注释 [DispatchKeySet 内部表示]
+在内部，`DispatchKey` 被打包成 **64 位**的 `DispatchKeySet` 对象，这些对象在运行时(runtime)被传递。然而，keyset中的bit与单个 `DispatchKey` 之间并不一定是一对一的映射。
+
+首先，为什么要有这种区别，为什么不将每个 `DispatchKey` 直接映射到一个位？这主要是因为**我们有几种不同后端想要自定义的功能类型**。例如：
+- “Dense”：CPU、CUDA、XLA……（约 16 个键）
+- “Sparse”：SparseCPU、SparseCUDA……
+- “SparseCsr”：SparseCsrCPU、SparseCsrCUDA……
+- “Quantized”：QuantizedCPU、QuantizedCUDA、QuantizedXLA……
+- “Autograd”：AutogradCPU、AutogradCUDA、Autograd XLA……
+
+问题是，随着后端数量和功能数量的增加，键的总数会呈二次方增长，这使得在不显著增加位集大小的情况下，很难将每个键直接映射到位集中的一个位。
+
+`BackendComponent` 和 `DispatchKey` 这两个枚举大致可以分为 5 类。
+
+1. **构建块键（Building block keys）**
+   - **定义**：这些是构成更复杂调度键的基础组件。它们分为两类：
+     - **后端构建块（Backend building blocks）**：例如`CPUBit`、`CUDABit`，代表硬件后端的基础标识。
+     - **功能构建块（Functionality building blocks）**：例如`Dense`、`Sparse`、`AutogradFunctionality`，代表跨后端的功能类别。
+   - **特点**：
+     - 它们是“原子”键，用于组合成运行时键。
+     - 每个构建块键在`DispatchKeySet`中占据一个独立的位（bit）。
+     - 它们本身并不直接用于内核注册，而是通过组合形成实际的运行时键。
+   - **目的**：避免为每个可能的组合（如`SparseCPU`）都分配一个独立的位，从而节省位空间。
+2. **运行时键（Runtime keys）**
+   - **定义**：这些键直接对应于操作符分派表中的槽位，是实际用于内核注册和调度的键。分为三类：
+     - **不可定制的后端（Non-customizable backends）**：例如`FPGA`，这些后端不能自定义功能（如没有`SparseFPGA`）。
+     - **不可定制的功能（Non-customizable functionalities）**：例如`Functionalize`，这些功能不按后端拆分（即没有`FunctionalizeCPU`）。
+     - **可定制的实例（Per-backend instances）**：例如`CPU`、`SparseCPU`、`AutogradCPU`。这些是由**构建块键组合**而成的键，代表特定后端上的特定功能。
+   - **特点**：
+     - 每个运行时键在操作符的分派表中都有一个对应的槽位。
+     - 开发者可以直接将内核注册到运行时键（如`m.impl("add", DispatchKey::CPU, &cpu_kernel)`）。
+     - 部分运行时键由构建块键组合而成（如`CPU = CPUBit + Dense`），而另一些（如`FPGA`）是独立的。
+3. **“别名” `DispatchKey`**（见注释 [别名调度键]）
+
+---
+上述3点展开解释：<br>
+
+1. **构建块键**始终对应于 `DispatchKeySet` 中的单个bit。它们也可以在 `DispatchKeySet` 中**组合以形成实际的运行时键**。例如：
+```cpp
+auto dense_cpu_ks = DispatchKeySet({DispatchKey::CPUBit, DispatchKey::Dense});
+// 该键集具有运行时 dense-cpu 键。
+dense_cpu_ks.has(DispatchKey::CPU);
+// 并且它也包含构建块键。
+dense_cpu_ks.has(DispatchKey::CPUBit);
+dense_cpu_ks.has(DispatchKey::Dense);
+```
+并非每个后端和每个功能都算作“构建块键”。这主要是为了在设计中给我们更多的调整空间。作为“构建块”的后端键和功能键将构成一个完整的可覆盖功能交叉乘积。
+
+例如，目前我们**至少有 12 个“后端”构建块**（CPU、CUDA、XLA……）和**至少 5 个“功能”构建块**（Dense、Sparse、SparseCsr、Quantized、AutogradFunctionality……）。这些键共同允许每个调度器操作以最多 12*4 种不同的方式进行自定义。每种方式都需要在每个调度器操作的操作符表中**占用一个槽位**。**并非**每项功能都需要针对每个后端进行自定义(**可以有缺失**)，也并非每个后端都需要能够自定义每种类型的功能。
+
+2. **每个运行时键直接对应于操作符运行时调度表中的一个槽位**，并且你可以直接向运行时调度键注册内核。
+
+对于像“Dense”或“AutogradFunctionality”这样的**每个后端功能**，你可以将相应的运行时调度键视为该功能在每个后端上的“实例”。例如，“CPU”、“CUDA”、“XLA”等都是“Dense”构建块键的运行时实例。
+
+（2.1）和（2.2）在 `DispatchKeySet` 逻辑中的表示方式相同：
+- 后端无关的功能（例如 `FuncTorchBatched`）**不能**针对每个后端进行自定义。
+  为了实现这一点，我们需要将其提升为每个后端功能的“构建块”键。
+- 不可自定义的后端（例如 FPGA）**不能**自定义现有功能，如 `Sparse`、`Autograd` 等。
+  为了实现这一点，我们需要将其提升为后端“构建块”键。
+
+在这两种情况下，这些键直接对应于操作符表中的运行时槽位。
+
+（3）“别名”键
+见注释 [别名调度键]
+
+最后说明：对于任何未来要对调度器 + `DispatchKeySet` 内部进行修改的人，有一个已关闭的拉取请求（PR），其中包含调度器的基本 Python 实现，这可能有助于快速测试和验证更改。请参阅：https://github.com/pytorch/pytorch/pull/68743
+
+## 3.2 代码
+
 ```c++
 // An undefined tensor is one with an empty tensor type set.
 class DispatchKeySet final {
@@ -416,7 +583,7 @@ class DispatchKeySet final {
     DispatchKey highestFunctionalityKey() const;
     BackendComponent highestBackendKey() const;
     DispatchKey highestPriorityTypeId() const;
-    uint8_t indexOfHighestBit() const;  
+    uint8_t indexOfHighestBit() const;
 
     int getDispatchTableIndexForDispatchKeySet() const {
     auto functionality_idx =
@@ -480,7 +647,6 @@ initializeFunctionalityOffsetsAndMasks() {
   return offsets_and_masks;
 }
 ```
-
 
 # 4 参考文档
 - [lets-talk-about-the-pytorch-dispatcher](http://blog.ezyang.com/2020/09/lets-talk-about-the-pytorch-dispatcher/)
