@@ -255,3 +255,97 @@ torch.cuda.synchronize()
 | **阻塞性**         | 非阻塞 CPU                           | 阻塞 CPU                             |
 | **典型用途**       | 流间依赖控制                         | 强制同步、计时、调试                 |
 
+# 3 cuda Strem
+
+**torch.cuda.Stream**
+
+>**Stream 里的操作都是用转为用Event 来实现的**. <br>
+
+```python
+class Stream(torch._C._CudaStreamBase, _StreamBase):
+    r"""Wrapper around a CUDA stream.
+
+    A CUDA stream is a linear sequence of execution that belongs to a specific
+    device, independent from other streams.  See :ref:`cuda-semantics` for
+    details.
+
+    Args:
+        device(torch.device or int, optional): a device on which to allocate
+            the stream. If :attr:`device` is ``None`` (default) or a negative
+            integer, this will use the current device.
+        priority(int, optional): priority of the stream, should be 0 or
+            negative, where negative numbers indicate higher priority. By default,
+            streams have priority 0.
+
+    """
+
+    def __new__(cls, device=None, priority=0, **kwargs):
+        # setting device manager is expensive, so we avoid it unless necessary
+        if device is None or ("stream_id" in kwargs and "device_index" in kwargs):
+            return super().__new__(cls, priority=priority, **kwargs)
+        else:
+            with torch.cuda.device(device):
+                return super().__new__(cls, priority=priority, **kwargs)
+
+    def wait_event(self, event) -> None:
+        r"""Make all future work submitted to the stream wait for an event.
+
+        Args:
+            event (torch.cuda.Event): an event to wait for.
+
+        .. note:: This is a wrapper around ``cudaStreamWaitEvent()``: see
+           `CUDA Stream documentation`_ for more info.
+
+           This function returns without waiting for :attr:`event`: only future
+           operations are affected.
+
+        .. _CUDA Stream documentation:
+           https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__STREAM.html
+        """
+        event.wait(self)
+
+    def wait_stream(self, stream) -> None:
+        r"""Synchronize with another stream.
+
+        All future work submitted to this stream will wait until all kernels
+        submitted to a given stream at the time of call complete.
+
+        Args:
+            stream (Stream): a stream to synchronize.
+
+        .. note:: This function returns without waiting for currently enqueued
+           kernels in :attr:`stream`: only future operations are affected.
+        """
+        self.wait_event(stream.record_event())
+
+    def record_event(self, event=None):
+        r"""Record an event.
+
+        Args:
+            event (torch.cuda.Event, optional): event to record. If not given, a new one
+                will be allocated.
+
+        Returns:
+            Recorded event.
+        """
+        if event is None:
+            event = Event()
+        event.record(self)
+        return event
+
+    def query(self) -> bool:
+        r"""Check if all the work submitted has been completed.
+
+        Returns:
+            A boolean indicating if all kernels in this stream are completed.
+        """
+        return super().query()
+
+    def synchronize(self) -> None:
+        r"""Wait for all the kernels in this stream to complete.
+
+        .. note:: This is a wrapper around ``cudaStreamSynchronize()``: see
+           `CUDA Stream documentation`_ for more info.
+        """
+        super().synchronize()
+```
