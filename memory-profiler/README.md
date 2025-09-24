@@ -1,6 +1,20 @@
 # 1 参考连接
 - [doc](https://pytorch.org/blog/understanding-gpu-memory-1/)
 
+```python
+# 开启记录，并设置最多记录100000个数据点
+torch.cuda.memory._record_memory_history(max_entries=100000)
+
+# 训练调用
+train(args)
+
+# 保存数据
+torch.cuda.memory._dump_snapshot(your_file_name.pickle)
+
+# 停掉记录，关闭snapshot
+torch.cuda.memory._record_memory_history(enabled=None)
+```
+
 # 2 用 Memory Snapshot 查看 Memory
 ```python
 import logging
