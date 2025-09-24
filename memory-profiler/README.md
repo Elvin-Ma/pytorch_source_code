@@ -15,6 +15,9 @@ torch.cuda.memory._dump_snapshot(your_file_name.pickle)
 torch.cuda.memory._record_memory_history(enabled=None)
 ```
 
+- 打开地址
+[open pickle](https://docs.pytorch.org/memory_viz)
+
 # 2 用 Memory Snapshot 查看 Memory
 ```python
 import logging
